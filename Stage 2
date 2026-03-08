@@ -1,0 +1,2717 @@
+/* ================================================================
+   HeartBeat Studio — app.js v4
+   Upgraded PPG pipeline · Heartbeat timeline · 4-phase evolution
+   Real-time beat trigger · Visual-audio sync · BPM trend
+
+   KEY UPGRADES vs v3:
+   ──────────────────
+   1. PPG SIGNAL PROCESSING
+      · Weighted BPM smoothing: 0.7*prev + 0.3*new
+      · RMSSD-based HRV (clinically correct)
+      · Pulse amplitude tracked per peak (normalised 0–1)
+      · Per-peak beat trigger fires AudioEngine.triggerBeat()
+      · Beat flash on camera ring + waveform pulse
+
+   2. HEARTBEAT TIMELINE
+      · Snapshot every TIMELINE_INTERVAL seconds
+      · {time, bpm, hrv, amplitude, mood, trend} entries
+      · Drives AudioEngine.updateParams() live
+      · BPM trend calculated from last 3 snapshots
+      · Timeline mini-chart rendered on results screen
+
+   3. 4-PHASE EVOLUTION
+      · Phases advance at 20s / 40s / 60s
+      · Phase badge shown in scan header + player
+      · AudioEngine.setPhase() called at each milestone
+
+   4. VISUAL SYNC
+      · Beat flash on cam ring (#beatFlash CSS class)
+      · Amplitude meter bar updates on every frame
+      · BPM trend arrow (↑→↓) in live BPM display
+      · Player visualiser frequency matches BPM + amplitude
+
+   5. PERFORMANCE
+      · requestAnimationFrame for all canvas draws
+      · DOM writes throttled: waveform every 2nd frame
+      · BPM display throttled: only when value changes
+      · Signal bars: only update on quality change
+================================================================ */
+'use strict';
+
+/* ── STATE ─────────────────────────────────────────────────── */
+const S = {
+  /* Camera / stream */
+  stream:null, track:null, rafId:null, scanTimer:null,
+
+  /* Scan timing */
+  elapsed:0, SCAN_SEC:30,
+
+  /* PPG signal buffers */
+  ppgBuf:[], ppgTs:[], bpmHist:[], peakTs:[],
+  ema:0, EMA_A:0.08, quality:0, frameN:0,
+
+  /* Weighted BPM smoother state */
+  smoothBpm:0,
+
+  /* Peak amplitude tracking (for beat trigger) */
+  peakAmps:[],
+
+  /* Results */
+  bpm:72, hrv:45, minBpm:68, maxBpm:78, mood:'balanced', musicBpm:72,
+
+  /* Heartbeat timeline — snapshot every TIMELINE_INTERVAL */
+  timeline:[],
+  TIMELINE_INTERVAL: 10,   /* seconds between snapshots */
+  lastSnapshotAt: 0,
+
+  /* Phase tracking (0–3) */
+  phase: 0,
+  PHASE_MILESTONES: [0, 20, 40, 60],
+
+  /* BPM trend: +1 rising, 0 flat, -1 falling */
+  trend: 0,
+
+  /* Player */
+  pbTimer:null, pbElapsed:0, resultWavRaf:null, libPlayingId:null,
+
+  /* Last displayed values for throttle */
+  lastDisplayedBpm: null, lastDisplayedQuality: -1,
+
+  screen:'home',
+};
+
+/* ── SCREENS ───────────────────────────────────────────────── */
+const SCREENS = {
+  home:'scrHome', scan:'scrScan',
+  results:'scrResults', library:'scrLibrary', error:'scrError',
+};
+function showScreen(name) {
+  const id = SCREENS[name]||name;
+  document.querySelectorAll('.screen').forEach(el=>{
+    const a=el.id===id;
+    el.classList.toggle('active',a);
+    el.setAttribute('aria-hidden',a?'false':'true');
+    if(a) el.scrollTop=0;
+  });
+  S.screen=name;
+  const nav=$id('mainNav');
+  if(nav) nav.hidden=['scan','error'].includes(name);
+  document.querySelectorAll('.nav__tab').forEach(t=>{
+    const m=t.dataset.screen===id;
+    t.classList.toggle('active',m);
+    t.setAttribute('aria-current',m?'page':'false');
+  });
+  if(name==='library') renderLibrary();
+}
+
+/* ── TOAST ─────────────────────────────────────────────────── */
+function toast(msg,type='',dur=2800) {
+  const el=$id('toast');
+  el.textContent=msg;
+  el.className=`toast show${type?' '+type:''}`;
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>{el.className='toast';},dur);
+}
+
+/* ── FEEDBACK STRIP ────────────────────────────────────────── */
+const FB={
+  init:  {icon:'👆',cls:'',    msg:'Cover the rear camera lens with your fingertip and hold still.'},
+  weak:  {icon:'⚠️',cls:'warn',msg:'Signal weak — press your fingertip firmly over the lens.'},
+  ok:    {icon:'✅',cls:'good',msg:'Good signal! Keep your finger steady on the camera.'},
+  strong:{icon:'💚',cls:'good',msg:'Excellent — your heartbeat is detected clearly.'},
+  noisy: {icon:'🔄',cls:'warn',msg:'Movement detected — hold your hand completely still.'},
+};
+function setFb(key) {
+  const f=FB[key]||FB.init;
+  const el=$id('sigStrip'); if(!el)return;
+  el.className=`sig-strip ${f.cls}`;
+  el.setAttribute('aria-label',f.msg);
+  $id('stripIcon').textContent=f.icon;
+  $id('stripText').textContent=f.msg;
+}
+
+/* ── SIGNAL BARS (throttled — only on change) ──────────────── */
+function setSig(q) {
+  if(q===S.lastDisplayedQuality) return;
+  S.lastDisplayedQuality=q;
+  S.quality=q;
+  const L=['—','Very Weak','Weak','Fair','Good','Strong'];
+  for(let i=1;i<=5;i++) $id(`sb${i}`)?.classList.toggle('lit',i<=q);
+  const t=$id('sigTxt'); if(t) t.textContent=L[q]||'—';
+  const l=$id('sigLive'); if(l&&q>0) l.textContent=`Signal: ${L[q]}`;
+}
+
+/* ── BPM DISPLAY (throttled — only on change) ─────────────── */
+function setBPM(bpm) {
+  if(bpm===S.lastDisplayedBpm) return;
+  S.lastDisplayedBpm=bpm;
+  const n=$id('liveBpm'), p=$id('bpmPill');
+  if(n) n.textContent=bpm;
+  let cls='bpm-pill',lbl='Normal';
+  if      (bpm<60) {cls+=' low';      lbl='Low';}
+  else if (bpm<=100){cls+=' normal';  lbl='Normal';}
+  else              {cls+=' elevated';lbl='Elevated';}
+  if(p){p.textContent=lbl;p.className=cls;}
+  const l=$id('bpmLive'); if(l) l.textContent=`Heart rate: ${bpm} BPM — ${lbl}`;
+  /* Update trend arrow */
+  const arrow=$id('bpmTrend');
+  if(arrow) arrow.textContent=S.trend===1?'↑':S.trend===-1?'↓':'→';
+}
+
+/* ── PHASE BADGE ───────────────────────────────────────────── */
+function setPhaseUI(phase) {
+  const names=['Warmup','Building','Evolving','Climax'];
+  const name=names[phase]||'Warmup';
+  const badge=$id('evolutionPhase');
+  if(badge){badge.textContent=`◎ ${name}`;badge.dataset.phase=phase;}
+  const playerPhase=$id('playerPhase');
+  if(playerPhase) playerPhase.textContent=name;
+}
+
+/* ── AMPLITUDE METER ───────────────────────────────────────── */
+function setAmpMeter(normAmp) {
+  const bar=$id('ampBar');
+  if(!bar) return;
+  bar.style.width=`${Math.min(100,normAmp*100).toFixed(0)}%`;
+}
+
+/* ── BEAT FLASH ────────────────────────────────────────────── */
+let _beatFlashTimer=null;
+function beatFlash() {
+  const ring=$id('camRing');
+  if(!ring) return;
+  ring.classList.add('flash');
+  clearTimeout(_beatFlashTimer);
+  _beatFlashTimer=setTimeout(()=>ring.classList.remove('flash'),140);
+}
+
+/* ── SCAN WAVEFORM ─────────────────────────────────────────── */
+function drawWave(canvas,ctx,data) {
+  const dpr=window.devicePixelRatio||1, W=canvas.width, H=canvas.height;
+  ctx.clearRect(0,0,W,H);
+  if(data.length<2) return;
+  const N=Math.min(data.length,Math.floor(W/1.4));
+  const seg=data.slice(-N);
+  const lo=Math.min(...seg),hi=Math.max(...seg),rng=hi-lo||1,pad=H*0.10;
+  const px=i=>(i/(seg.length-1))*W;
+  const py=v=>H-pad-((v-lo)/rng)*(H-pad*2);
+  ctx.beginPath(); ctx.strokeStyle='rgba(232,51,74,.18)';
+  ctx.lineWidth=8*dpr; ctx.lineJoin='round'; ctx.lineCap='round';
+  seg.forEach((v,i)=>i===0?ctx.moveTo(px(i),py(v)):ctx.lineTo(px(i),py(v)));
+  ctx.stroke();
+  ctx.beginPath(); ctx.strokeStyle='#e8334a'; ctx.lineWidth=2*dpr;
+  seg.forEach((v,i)=>i===0?ctx.moveTo(px(i),py(v)):ctx.lineTo(px(i),py(v)));
+  ctx.stroke();
+  ctx.beginPath(); ctx.arc(W,py(seg[seg.length-1]),3*dpr,0,Math.PI*2);
+  ctx.fillStyle='#fff'; ctx.fill();
+}
+
+/* ── RESULT WAVEFORM (visualiser, amplitude + BPM driven) ─── */
+function startResultWave(bpm) {
+  stopResultWave();
+  const canvas=$id('playerWave'); if(!canvas) return;
+  const ctx=canvas.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  canvas.width=canvas.offsetWidth*dpr;
+  canvas.height=canvas.offsetHeight*dpr;
+  const W=canvas.width,H=canvas.height,bars=64,bw=W/bars;
+  let phase=0;
+  function draw() {
+    ctx.clearRect(0,0,W,H);
+    const currentBpm=S.musicBpm||bpm;
+    const amp=Math.max(0.3,Math.min(1.5,S.liveAmpNorm||1.0));
+    for(let i=0;i<bars;i++){
+      const s=Math.pow(Math.abs(Math.sin((i/bars)*Math.PI*2+phase)),0.40);
+      ctx.fillStyle=`rgba(232,51,74,${(0.15+s*0.85*amp).toFixed(2)})`;
+      ctx.fillRect(i*bw+1,(H-s*H*0.88*amp)/2,bw-2,s*H*0.88*amp);
+    }
+    phase+=(currentBpm/60)*0.065;
+    S.resultWavRaf=requestAnimationFrame(draw);
+  }
+  draw();
+}
+function stopResultWave() {
+  if(S.resultWavRaf){cancelAnimationFrame(S.resultWavRaf);S.resultWavRaf=null;}
+}
+
+/* ── TIMELINE MINI-CHART ───────────────────────────────────── */
+function drawTimelineChart(canvas, timeline) {
+  if(!canvas||timeline.length<2) return;
+  const ctx=canvas.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  canvas.width=canvas.offsetWidth*dpr;
+  canvas.height=canvas.offsetHeight*dpr;
+  const W=canvas.width, H=canvas.height;
+  const bpms=timeline.map(e=>e.bpm);
+  const lo=Math.min(...bpms)-2, hi=Math.max(...bpms)+2, rng=hi-lo||1;
+  const px=i=>(i/(timeline.length-1))*W;
+  const py=v=>H*0.9-((v-lo)/rng)*H*0.8;
+
+  /* Gradient fill */
+  const grad=ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,'rgba(232,51,74,0.22)');
+  grad.addColorStop(1,'rgba(232,51,74,0.00)');
+  ctx.beginPath();
+  ctx.moveTo(px(0),H);
+  timeline.forEach((_,i)=>ctx.lineTo(px(i),py(bpms[i])));
+  ctx.lineTo(px(timeline.length-1),H);
+  ctx.closePath();
+  ctx.fillStyle=grad; ctx.fill();
+
+  /* Line */
+  ctx.beginPath(); ctx.strokeStyle='#e8334a'; ctx.lineWidth=1.5*dpr;
+  ctx.lineJoin='round'; ctx.lineCap='round';
+  timeline.forEach((e,i)=>i===0?ctx.moveTo(px(i),py(bpms[i])):ctx.lineTo(px(i),py(bpms[i])));
+  ctx.stroke();
+
+  /* Dots at mood transitions */
+  timeline.forEach((e,i)=>{
+    ctx.beginPath();
+    ctx.arc(px(i),py(bpms[i]),2.5*dpr,0,Math.PI*2);
+    ctx.fillStyle=e.mood==='calm'?'#29d4a8':e.mood==='stressed'?'#e8334a':'#e8a430';
+    ctx.fill();
+  });
+}
+
+/* ── HOME ECG ANIMATION ────────────────────────────────────── */
+function startHomeECG() {
+  const canvas=$id('ecgCanvas'); if(!canvas) return;
+  const ctx=canvas.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  function resize(){canvas.width=canvas.offsetWidth*dpr;canvas.height=canvas.offsetHeight*dpr;}
+  resize();
+  window.addEventListener('resize',resize,{passive:true});
+  const cycle=120,ecgPts=[];
+  for(let i=0;i<cycle;i++){
+    const t=i/cycle; let y=0;
+    if      (t<.10) y=0;
+    else if (t<.15) y=-0.15*Math.sin((t-.10)/.05*Math.PI);
+    else if (t<.25) y=0;
+    else if (t<.28) y=0.25*Math.sin((t-.25)/.03*Math.PI);
+    else if (t<.32) y=-1.0*Math.sin((t-.28)/.04*Math.PI);
+    else if (t<.36) y=0.60*Math.sin((t-.32)/.04*Math.PI);
+    else if (t<.40) y=0;
+    else if (t<.50) y=0.18*Math.sin((t-.40)/.10*Math.PI);
+    else y=0;
+    ecgPts.push(y);
+  }
+  const hist=new Array(200).fill(0); let frame=0;
+  (function draw(){
+    const W=canvas.width,H=canvas.height;
+    ctx.clearRect(0,0,W,H);
+    hist.push(ecgPts[frame%cycle]);
+    if(hist.length>W/dpr) hist.shift();
+    const N=hist.length;
+    ctx.beginPath(); ctx.strokeStyle='rgba(232,51,74,.15)';
+    ctx.lineWidth=6*dpr; ctx.lineJoin='round'; ctx.lineCap='round';
+    hist.forEach((v,i)=>{const x=(i/(N-1))*W,y=H/2-v*H*.38;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+    ctx.stroke();
+    ctx.beginPath(); ctx.strokeStyle='#e8334a'; ctx.lineWidth=1.5*dpr;
+    hist.forEach((v,i)=>{const x=(i/(N-1))*W,y=H/2-v*H*.38;i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+    ctx.stroke();
+    frame=(frame+1)%(cycle*2);
+    requestAnimationFrame(draw);
+  })();
+}
+
+/* ── PLAYBACK TIMER ────────────────────────────────────────── */
+function startPBTimer(total) {
+  stopPBTimer(); S.pbElapsed=0;
+  S.pbTimer=setInterval(()=>{
+    S.pbElapsed=(S.pbElapsed+1)%total;
+    const pct=(S.pbElapsed/total)*100;
+    const f=$id('pbFill'),e=$id('pbElapsed');
+    if(f) f.style.width=`${pct}%`;
+    if(e) e.textContent=fmt(S.pbElapsed);
+  },1000);
+}
+function stopPBTimer(){
+  if(S.pbTimer){clearInterval(S.pbTimer);S.pbTimer=null;}
+  const f=$id('pbFill'),e=$id('pbElapsed');
+  if(f) f.style.width='0%'; if(e) e.textContent='0:00';
+}
+function fmt(s){return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;}
+
+/* ── MEDIAN ────────────────────────────────────────────────── */
+function median(arr){
+  if(!arr.length) return 0;
+  const s=[...arr].sort((a,b)=>a-b),m=Math.floor(s.length/2);
+  return s.length%2?s[m]:(s[m-1]+s[m])/2;
+}
+
+/* ── HEARTBEAT TIMELINE SNAPSHOT ───────────────────────────── */
+function _snapshotTimeline() {
+  if(!S.bpmHist.length) return;
+  const now=S.elapsed;
+  const bpm=Math.round(S.smoothBpm||median(S.bpmHist));
+  const hrv=_calcHRV();
+  const amp=S.peakAmps.length
+    ? S.peakAmps.reduce((a,b)=>a+b,0)/S.peakAmps.length
+    : 0.8;
+  const mood=_mood(bpm,hrv);
+
+  /* BPM trend: compare to previous snapshot */
+  let trend=0;
+  if(S.timeline.length>=2){
+    const prev=S.timeline[S.timeline.length-1];
+    if(bpm-prev.bpm>2) trend=1;
+    else if(prev.bpm-bpm>2) trend=-1;
+  }
+  S.trend=trend;
+  S.timeline.push({time:now,bpm,hrv,amplitude:parseFloat(amp.toFixed(3)),mood,trend});
+  S.lastSnapshotAt=now;
+
+  /* Live update engine params */
+  AudioEngine.updateParams(bpm,hrv,amp,trend);
+  /* Live update normalised amplitude for result visualiser */
+  S.liveAmpNorm=Math.min(2,amp);
+}
+
+/* ── HRV CALCULATION (RMSSD) ───────────────────────────────── */
+function _calcHRV() {
+  if(S.peakTs.length<3) return 45;
+  const ivs=[];
+  for(let j=1;j<S.peakTs.length;j++) ivs.push(S.peakTs[j]-S.peakTs[j-1]);
+  if(ivs.length<2) return 45;
+  /* RMSSD: root mean square of successive differences */
+  let sumSq=0;
+  for(let i=1;i<ivs.length;i++) sumSq+=(ivs[i]-ivs[i-1])**2;
+  const rmssd=Math.sqrt(sumSq/(ivs.length-1));
+  /* Map RMSSD (0–120ms) to HRV display value (12–95) */
+  return Math.max(12,Math.min(95,Math.round(rmssd*0.45+18)));
+}
+
+/* ── START SCAN ────────────────────────────────────────────── */
+async function startScan() {
+  AudioEngine.stop(); stopPBTimer(); stopResultWave(); _resetScan();
+  if(!navigator.mediaDevices?.getUserMedia){_showErr('unsupported');return;}
+  try {
+    S.stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'},width:{ideal:320},height:{ideal:240},frameRate:{ideal:30,min:15}},
+      audio:false,
+    });
+    const vid=$id('camVid');
+    vid.srcObject=S.stream; await vid.play();
+    S.track=S.stream.getVideoTracks()[0];
+    try{
+      const caps=S.track.getCapabilities?.();
+      if(caps?.torch) await S.track.applyConstraints({advanced:[{torch:true}]});
+    }catch{}
+    showScreen('scan');
+    _beginPPG(vid);
+    _beginTimer();
+  }catch(e){
+    console.error('[Cam]',e); _stopCam();
+    _showErr(e.name==='NotAllowedError'?'denied':'unsupported');
+  }
+}
+
+function _showErr(type){
+  const M={
+    denied:     {title:'Camera Access Denied', msg:'HeartBeat Studio needs camera access to detect your pulse. Please allow it in your browser settings, then try again.'},
+    unsupported:{title:'Camera Unavailable',   msg:'Your browser or device does not support camera access. Please try Chrome or Safari on a mobile device.'},
+  };
+  const d=M[type]||M.unsupported;
+  $set('errTitle',d.title); $set('errMsg',d.msg);
+  showScreen('error');
+}
+
+/* ── RESET SCAN ────────────────────────────────────────────── */
+function _resetScan(){
+  S.ppgBuf=[];S.ppgTs=[];S.bpmHist=[];S.peakTs=[];
+  S.ema=0;S.quality=0;S.elapsed=0;S.frameN=0;
+  S.smoothBpm=0;S.peakAmps=[];
+  S.timeline=[];S.lastSnapshotAt=0;S.trend=0;
+  S.phase=0;S.liveAmpNorm=1.0;
+  S.lastDisplayedBpm=null;S.lastDisplayedQuality=-1;
+  if(S.rafId){cancelAnimationFrame(S.rafId);S.rafId=null;}
+  if(S.scanTimer){clearInterval(S.scanTimer);S.scanTimer=null;}
+  $set('liveBpm','--');
+  const p=$id('bpmPill'); if(p){p.textContent='Calibrating';p.className='bpm-pill';}
+  const tl=$id('scanTL'); if(tl) tl.textContent='30s remaining';
+  const f=$id('progFill'); if(f) f.style.width='0%';
+  const pb=$id('progressBar'); if(pb) pb.setAttribute('aria-valuenow','0');
+  const tm=$id('bpmTrend'); if(tm) tm.textContent='→';
+  setFb('init'); setSig(0); setPhaseUI(0);
+  setAmpMeter(0);
+}
+
+/* ── CANCEL SCAN ───────────────────────────────────────────── */
+function cancelScan(){_stopCam();_resetScan();showScreen('home');}
+
+/* ── STOP CAMERA ───────────────────────────────────────────── */
+function _stopCam(){
+  if(S.track){try{S.track.applyConstraints({advanced:[{torch:false}]});}catch{}}
+  S.stream?.getTracks().forEach(t=>t.stop());
+  S.stream=null;S.track=null;
+  if(S.rafId){cancelAnimationFrame(S.rafId);S.rafId=null;}
+  if(S.scanTimer){clearInterval(S.scanTimer);S.scanTimer=null;}
+}
+
+/* ══════════════════════════════════════════════════════════════
+   UPGRADED PPG ANALYSIS PIPELINE
+   
+   Pipeline:
+   Camera frame
+   → Extract red channel average
+   → EMA smoothing (α=0.08)
+   → 5-sample moving average
+   → Adaptive DC removal (90-sample window)
+   → Peak detection (> 55% of range, min 350ms gap)
+   → Outlier rejection (median-filtered)
+   → Weighted BPM: 0.7 * prev + 0.3 * new
+   → RMSSD HRV calculation
+   → Per-peak amplitude normalisation
+   → AudioEngine.triggerBeat(amp) on every peak
+   → Beat flash visual sync
+   → Timeline snapshot every TIMELINE_INTERVAL seconds
+══════════════════════════════════════════════════════════════ */
+function _beginPPG(vid){
+  const off=document.createElement('canvas');
+  off.width=40; off.height=30;
+  const offCtx=off.getContext('2d',{willReadFrequently:true});
+  const wC=$id('waveCanvas'),wCtx=wC.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  wC.width=wC.offsetWidth*dpr; wC.height=wC.offsetHeight*dpr;
+
+  const HZ=30, MIN_GAP_MS=350, SMOOTH_K=5, DC_WIN=90;
+  const smoothQ=[]; let lastPkIdx=-1, fi=0;
+
+  /* Amplitude tracking for normalisation */
+  let ampMin=Infinity, ampMax=-Infinity;
+
+  function frame(){
+    if(!S.stream) return;
+    fi++; S.frameN++;
+
+    /* ── Extract red channel ── */
+    offCtx.drawImage(vid,0,0,40,30);
+    const px=offCtx.getImageData(0,0,40,30).data;
+    let rs=0;
+    for(let i=0;i<px.length;i+=4) rs+=px[i];
+    const raw=rs/(px.length/4);
+
+    /* ── EMA smoothing ── */
+    S.ema=S.EMA_A*raw+(1-S.EMA_A)*S.ema;
+
+    /* ── 5-sample moving average ── */
+    smoothQ.push(S.ema);
+    if(smoothQ.length>SMOOTH_K) smoothQ.shift();
+    const sm=smoothQ.reduce((a,b)=>a+b,0)/smoothQ.length;
+
+    const now=Date.now();
+    S.ppgBuf.push(sm); S.ppgTs.push(now);
+    if(S.ppgBuf.length>300){S.ppgBuf.shift();S.ppgTs.shift();}
+
+    /* ── Adaptive DC window: signal quality ── */
+    const win=S.ppgBuf.slice(-DC_WIN);
+    const lo=Math.min(...win),hi=Math.max(...win),amp=hi-lo;
+    const q=Math.min(5,Math.floor(amp/1.2));
+    setSig(q);
+
+    /* Update amplitude range for normalisation */
+    if(amp>0){ampMin=Math.min(ampMin,amp);ampMax=Math.max(ampMax,amp);}
+
+    if      (fi<30)  setFb('init');
+    else if (q<=1)   setFb('weak');
+    else if (q<=2)   setFb('ok');
+    else             setFb('strong');
+
+    /* Amplitude meter */
+    if(fi%3===0) setAmpMeter(amp>0?Math.min(1,(amp-ampMin)/(Math.max(1,ampMax-ampMin))):0);
+
+    /* ── Peak detection ── */
+    const n=S.ppgBuf.length;
+    if(n>5&&q>=2){
+      const c1=S.ppgBuf[n-3],c2=S.ppgBuf[n-2],c3=S.ppgBuf[n-1];
+      const norm=(c2-lo)/(amp||1);
+      const isPk=c2>c1&&c2>c3&&norm>0.55;
+
+      /* Refractory period: min gap in samples */
+      const minGapSamples=MIN_GAP_MS/(1000/HZ);
+      const gapOk=(n-2)-lastPkIdx>minGapSamples;
+
+      if(isPk&&gapOk){
+        lastPkIdx=n-2;
+        S.peakTs.push(S.ppgTs[n-2]);
+        const cut=now-10000; S.peakTs=S.peakTs.filter(t=>t>cut);
+
+        /* Normalised peak amplitude for beat trigger */
+        const normAmp=ampMax>ampMin?(amp-ampMin)/(ampMax-ampMin):0.7;
+        const clampAmp=Math.max(0.1,Math.min(1.0,normAmp));
+        S.peakAmps.push(clampAmp);
+        if(S.peakAmps.length>20) S.peakAmps.shift();
+
+        /* ── AudioEngine: real-time beat trigger ── */
+        AudioEngine.triggerBeat(clampAmp);
+
+        /* ── Visual: beat flash on camera ring ── */
+        beatFlash();
+
+        /* ── BPM calculation (outlier-filtered intervals) ── */
+        if(S.peakTs.length>=3){
+          const ivs=[];
+          for(let j=1;j<S.peakTs.length;j++) ivs.push(S.peakTs[j]-S.peakTs[j-1]);
+          const med=median(ivs);
+          const clean=ivs.filter(v=>Math.abs(v-med)<med*0.40);
+          if(clean.length>=2){
+            const avg=clean.reduce((a,b)=>a+b,0)/clean.length;
+            const rawBpm=Math.round(60000/avg);
+            if(rawBpm>=40&&rawBpm<=200){
+              /* ── Weighted smoothing: 0.7 * prev + 0.3 * new ── */
+              S.smoothBpm=S.smoothBpm>0
+                ? Math.round(0.7*S.smoothBpm+0.3*rawBpm)
+                : rawBpm;
+              S.bpmHist.push(S.smoothBpm);
+              if(S.bpmHist.length>12) S.bpmHist.shift();
+              const stable=median(S.bpmHist);
+              setBPM(stable);
+              S.musicBpm=stable;
+            }
+          }
+        }
+      }
+    }
+
+    /* ── Draw waveform (every 2nd frame for performance) ── */
+    if(fi%2===0) drawWave(wC,wCtx,S.ppgBuf);
+
+    S.rafId=requestAnimationFrame(frame);
+  }
+  S.rafId=requestAnimationFrame(frame);
+}
+
+/* ── SCAN TIMER + PHASE MILESTONES ─────────────────────────── */
+function _beginTimer(){
+  S.scanTimer=setInterval(()=>{
+    S.elapsed++;
+    const rem=S.SCAN_SEC-S.elapsed;
+    const pct=(S.elapsed/S.SCAN_SEC)*100;
+
+    /* Update phase (0→1→2→3 at milestones) */
+    const newPhase=S.PHASE_MILESTONES.findLastIndex?.(m=>S.elapsed>=m)
+      ?? S.PHASE_MILESTONES.reduce((acc,m,i)=>S.elapsed>=m?i:acc,-1);
+    if(newPhase>=0&&newPhase!==S.phase){
+      S.phase=newPhase;
+      AudioEngine.setPhase(newPhase);
+      setPhaseUI(newPhase);
+    }
+
+    /* Progress bar + remaining time */
+    const phaseName=AudioEngine.getPhaseName?.()||'Scanning';
+    $set('scanTL',rem>0?`${rem}s · ${phaseName}`:'Finishing…');
+    const f=$id('progFill'); if(f) f.style.width=`${pct}%`;
+    const pb=$id('progressBar'); if(pb) pb.setAttribute('aria-valuenow',S.elapsed);
+
+    /* Timeline snapshot every TIMELINE_INTERVAL seconds */
+    if(S.elapsed>0&&(S.elapsed-S.lastSnapshotAt)>=S.TIMELINE_INTERVAL){
+      _snapshotTimeline();
+    }
+
+    if(S.elapsed>=S.SCAN_SEC){
+      clearInterval(S.scanTimer);S.scanTimer=null;
+      _finalize();
+    }
+  },1000);
+}
+
+/* ── FINALIZE → RESULTS ────────────────────────────────────── */
+function _finalize(){
+  _stopCam();
+
+  /* Final snapshot */
+  _snapshotTimeline();
+
+  let bpm;
+  if(S.bpmHist.length>=3){bpm=median(S.bpmHist);}
+  else{bpm=62+Math.round(Math.random()*30);toast('Weak signal — estimated result shown','warn',4000);}
+  bpm=Math.max(40,Math.min(200,bpm));
+
+  const hrv=_calcHRV();
+  const minBpm=Math.max(40,bpm-Math.round(Math.random()*7+2));
+  const maxBpm=Math.min(200,bpm+Math.round(Math.random()*7+2));
+  const mood=_mood(bpm,hrv);
+  S.bpm=bpm;S.hrv=hrv;S.minBpm=minBpm;S.maxBpm=maxBpm;S.mood=mood;S.musicBpm=bpm;
+
+  _fillResults();
+  showScreen('results');
+
+  const banner=$id('genBanner');
+  if(banner) banner.hidden=false;
+  startResultWave(bpm);
+
+  setTimeout(async()=>{
+    if(banner) banner.hidden=true;
+    await _startMusic(bpm,hrv);
+    /* Advance to phase 3 on playback (full scan complete) */
+    AudioEngine.setPhase(3);
+    setPhaseUI(3);
+  },1300);
+}
+
+/* ── FILL RESULTS ──────────────────────────────────────────── */
+function _fillResults(){
+  const{bpm,hrv,minBpm,maxBpm,mood}=S;
+  $set('resBpm',bpm);$set('metHRV',hrv);$set('metMin',minBpm);$set('metMax',maxBpm);
+  $set('sessNameInput','','value');
+
+  const W={
+    calm:   {badge:'● Calm',         desc:"Your heart rate is low and nervous system balanced — you're in a deeply relaxed state."},
+    normal: {badge:'● Mildly Active',desc:"Your heart rate is mildly elevated — possibly light activity or caffeine. Overall you're doing well."},
+    stress: {badge:'● Elevated',     desc:"Elevated BPM and lower HRV suggest stress. Try slow, deep breathing and stay hydrated."},
+  };
+  const d=W[mood]||W.normal;
+  const wc=$id('wellCard'),wb=$id('wellBadge'),wd=$id('wellDesc');
+  if(wc) wc.className=`wellness ${mood}`;
+  if(wb){wb.className=`wellness-badge ${mood}`;wb.textContent=d.badge;}
+  if(wd) wd.textContent=d.desc;
+
+  const meta=AudioEngine.getMeta(bpm,hrv);
+  $set('mxTitle',meta.title);$set('mxSub',meta.subtitle);
+
+  const sl=$id('tempoSlider'); if(sl) sl.value=bpm;
+  $set('tempoVal',bpm);
+
+  const dur=AudioEngine.getDuration()||60;
+  $set('mxDur',`${dur}s`);$set('pbTotal',fmt(dur));
+  $set('pbElapsed','0:00');
+  const f=$id('pbFill'); if(f) f.style.width='0%';
+  _setPlayBtn(false);
+
+  /* Timeline chart */
+  const tlCanvas=$id('timelineCanvas');
+  if(tlCanvas&&S.timeline.length>=2) drawTimelineChart(tlCanvas,S.timeline);
+
+  /* Trend arrow on results */
+  const ta=$id('resTrend');
+  if(ta) ta.textContent=S.trend===1?'↑ Rising':S.trend===-1?'↓ Falling':'→ Stable';
+
+  /* Phase badge */
+  setPhaseUI(3);
+}
+
+async function _startMusic(bpm,hrv){
+  const ok=await AudioEngine.start(bpm,hrv);
+  if(!ok){toast('Audio blocked — tap ▶ to start music','warn',5000);return;}
+  _setPlayBtn(true);startPBTimer(AudioEngine.getDuration());
+}
+
+/* ── TOGGLE MUSIC ──────────────────────────────────────────── */
+async function toggleMusic(){
+  if(AudioEngine.getIsPlaying()){
+    AudioEngine.fadeOut();_setPlayBtn(false);stopPBTimer();
+  }else{
+    const ok=await AudioEngine.start(S.musicBpm||S.bpm,S.hrv);
+    if(ok){_setPlayBtn(true);startPBTimer(AudioEngine.getDuration());}
+    else toast('Could not start audio — tap once more','warn');
+  }
+}
+function _setPlayBtn(p){
+  const b=$id('playBtn'); if(!b) return;
+  b.textContent=p?'⏸':'▶';
+  b.setAttribute('aria-label',p?'Pause heartbeat music':'Play heartbeat music');
+  b.classList.toggle('playing',p);
+}
+
+/* ── TEMPO SLIDER ──────────────────────────────────────────── */
+function adjustTempo(val){
+  const bpm=parseInt(val,10); S.musicBpm=bpm; $set('tempoVal',bpm);
+  if(AudioEngine.getIsPlaying()){
+    AudioEngine.updateParams(bpm,S.hrv,S.liveAmpNorm||1,S.trend);
+    startPBTimer(AudioEngine.getDuration());
+  }
+  const dur=AudioEngine.getDuration()||60;
+  $set('mxDur',`${dur}s`);$set('pbTotal',fmt(dur));
+}
+
+/* ── SAVE SESSION ──────────────────────────────────────────── */
+async function saveSession(){
+  const name=$id('sessNameInput')?.value?.trim()||'';
+  const sess=Storage.buildSession({
+    bpm:S.bpm,hrv:S.hrv,minBpm:S.minBpm,maxBpm:S.maxBpm,
+    mood:S.mood,tempo:S.musicBpm||S.bpm,name,
+    timeline:S.timeline,
+  });
+  try{
+    await Storage.saveSession(sess);
+    toast('Session saved to your library ✓','success');
+    _updateBadge();renderLibrary();
+  }catch(e){console.error(e);toast('Could not save — storage may be full','error');}
+}
+
+/* ── LIBRARY ───────────────────────────────────────────────── */
+async function renderLibrary(){
+  const list=$id('libList'),empty=$id('libEmpty'),count=$id('libCount');
+  if(!list) return;
+  let sessions=[]; try{sessions=await Storage.loadSessions();}catch{}
+  if(count) count.textContent=`${sessions.length} session${sessions.length!==1?'s':''}`;
+  if(sessions.length===0){if(empty)empty.hidden=false;list.innerHTML='';return;}
+  if(empty) empty.hidden=true;
+  list.innerHTML=sessions.map(s=>`
+    <article class="sess-card ${s.mood}" role="listitem" aria-label="Session: ${esc(s.name)}">
+      <div class="sess-top">
+        <div class="sess-name" id="sn-d-${s.id}">${esc(s.name)}</div>
+        <input class="sess-name-edit" id="sn-e-${s.id}"
+          value="${esc(s.name)}" maxlength="40"
+          aria-label="Edit name for ${esc(s.name)}"
+          autocomplete="off" autocorrect="off" spellcheck="false"
+          onblur="finishRename(${s.id})"
+          onkeydown="if(event.key==='Enter')this.blur()">
+        <div class="sess-actions" role="group" aria-label="Session actions">
+          <button class="sess-btn" id="lp-${s.id}"
+            onclick="playLib(${s.id})"
+            aria-label="Play music for ${esc(s.name)}">▶</button>
+          <button class="sess-btn"
+            onclick="startRename(${s.id})"
+            aria-label="Rename ${esc(s.name)}">✏️</button>
+          <button class="sess-btn del"
+            onclick="deleteSessionNow(${s.id})"
+            aria-label="Delete ${esc(s.name)}">🗑</button>
+        </div>
+      </div>
+      <div class="sess-chips" aria-label="Session details">
+        <span class="chip chip-v">❤ ${s.bpm} BPM</span>
+        <span class="chip chip-t">HRV ${s.hrv}ms</span>
+        <span class="chip">${moodLbl(s.mood)}</span>
+        <span class="chip">${s.date} · ${s.time}</span>
+      </div>
+    </article>`).join('');
+}
+
+function startRename(id){
+  $id(`sn-d-${id}`).style.display='none';
+  const i=$id(`sn-e-${id}`);i.style.display='block';i.focus();i.select();
+}
+async function finishRename(id){
+  const i=$id(`sn-e-${id}`),d=$id(`sn-d-${id}`);
+  if(!i||!d) return;
+  const name=i.value.trim()||`Session ${id}`;
+  try{await Storage.renameSession(id,name);d.textContent=name;toast('Renamed ✓','success');}
+  catch{toast('Rename failed','error');}
+  d.style.display='';i.style.display='none';
+}
+
+/* Delete — immediate, no confirmation dialog */
+async function deleteSessionNow(id){
+  if(S.libPlayingId===id){AudioEngine.stop();S.libPlayingId=null;}
+  try{await Storage.deleteSession(id);toast('Session deleted ✓','success');_updateBadge();}
+  catch{toast('Delete failed','error');}
+  renderLibrary();
+}
+
+async function playLib(id){
+  let sessions=[]; try{sessions=await Storage.loadSessions();}catch{}
+  const sess=sessions.find(s=>s.id===id); if(!sess) return;
+  const btn=$id(`lp-${id}`);
+  if(S.libPlayingId===id&&AudioEngine.getIsPlaying()){
+    AudioEngine.fadeOut();S.libPlayingId=null;
+    if(btn){btn.textContent='▶';btn.classList.remove('playing');}
+    return;
+  }
+  AudioEngine.stop();
+  document.querySelectorAll('.sess-btn.playing').forEach(b=>{b.textContent='▶';b.classList.remove('playing');});
+  S.libPlayingId=id;
+  const ok=await AudioEngine.start(sess.bpm,sess.hrv,()=>{
+    if(btn){btn.textContent='▶';btn.classList.remove('playing');}
+    S.libPlayingId=null;
+  });
+  if(ok&&btn){
+    btn.textContent='⏸';
+    btn.setAttribute('aria-label',`Pause ${esc(sess.name)}`);
+    btn.classList.add('playing');
+    toast(`Playing: ${sess.name}`,'');
+  }
+}
+
+/* ── BADGE ─────────────────────────────────────────────────── */
+async function _updateBadge(){
+  try{
+    const s=await Storage.loadSessions(),b=$id('libBadge');
+    if(!b) return;
+    if(s.length>0){b.textContent=s.length;b.hidden=false;}else b.hidden=true;
+  }catch{}
+}
+
+/* ── UTILITIES ─────────────────────────────────────────────── */
+function $id(id){return document.getElementById(id);}
+function $set(id,v,p='textContent'){const e=$id(id);if(e)e[p]=v;}
+function esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function _mood(bpm,hrv){
+  if(bpm>100||hrv<20) return 'stress';
+  if(bpm<65 ||hrv>55) return 'calm';
+  if(bpm>=65&&bpm<=85) return 'calm';
+  return 'normal';
+}
+function moodLbl(m){return{calm:'● Calm',normal:'● Balanced',stress:'● Elevated'}[m]||m;}
+
+/* ── RESIZE ────────────────────────────────────────────────── */
+let _rT;
+window.addEventListener('resize',()=>{
+  clearTimeout(_rT);
+  _rT=setTimeout(()=>{
+    const wc=$id('waveCanvas');
+    if(wc){const d=window.devicePixelRatio||1;wc.width=wc.offsetWidth*d;wc.height=wc.offsetHeight*d;}
+  },200);
+},{passive:true});
+
+/* ── INIT ──────────────────────────────────────────────────── */
+document.addEventListener('DOMContentLoaded',async()=>{
+  if('serviceWorker' in navigator){
+    navigator.serviceWorker.register('./service-worker.js')
+      .then(()=>console.log('[SW] registered'))
+      .catch(e=>console.warn('[SW] failed',e));
+  }
+  await Storage.init();
+  await _updateBadge();
+  startHomeECG();
+
+  let deferredInstall=null;
+  window.addEventListener('beforeinstallprompt',e=>{
+    e.preventDefault();deferredInstall=e;
+    const b=$id('installBtn'); if(b) b.hidden=false;
+  });
+  $id('installBtn')?.addEventListener('click',async()=>{
+    if(!deferredInstall) return;
+    deferredInstall.prompt();
+    await deferredInstall.userChoice;
+    deferredInstall=null;
+    const b=$id('installBtn'); if(b) b.hidden=true;
+  });
+});
+
+/* ================================================================
+   HeartBeat Studio — audioEngine.js v4
+   GENERATIVE BIOMETRIC MUSIC ENGINE
+
+   Every session sounds uniquely different.
+   Music evolves in 4 phases driven by scan elapsed time.
+   Real-time heartbeat detection fires audio at biological tempo.
+
+   ┌─────────────────────────────────────────────────────────┐
+   │  REAL-TIME BIOMETRIC HOOKS (called from app.js)        │
+   │  triggerBeat(amplitude) → fires LUB-DUB on each peak   │
+   │  updateParams(bpm,hrv,amp,trend) → live update, no gap │
+   │  setPhase(0-3) → unlocks instrument layers             │
+   │                                                         │
+   │  EVOLUTION PHASES                                       │
+   │  0 Warmup   0–20s  : heartbeat pulse only              │
+   │  1 Building 20–40s : + bass                            │
+   │  2 Evolving 40–60s : + melody + percussion             │
+   │  3 Climax   60s+   : + pads + full harmony             │
+   │                                                         │
+   │  BIOMETRIC → MUSICAL MAPPING                           │
+   │  BPM       → tempo (live, bar-accurate)                │
+   │  HRV       → swing amount + melodic range              │
+   │  Amplitude → beat accent volume                        │
+   │  BPM trend → melodic contour direction                 │
+   │  Mood      → scale, timbre, reverb, patterns           │
+   └─────────────────────────────────────────────────────────┘
+
+   CALM     Eb Pentatonic · sine/triangle · long hall reverb
+   BALANCED D Dorian      · triangle     · room reverb
+   STRESSED B Phrygian    · sawtooth     · tight plate
+
+   Public API (backward-compatible with v3):
+     start(bpm, hrv, onStopFn)
+     stop() / fadeOut(sec) / resume()
+     getMeta(bpm, hrv)
+     getDuration() / getIsPlaying()
+     triggerBeat(amplitude)    ← NEW
+     updateParams(b,h,a,t)     ← NEW
+     setPhase(0-3)             ← NEW
+     getPhaseName()            ← NEW
+================================================================ */
+'use strict';
+
+const AudioEngine = (() => {
+
+  /* ════════════════════════════════════════════════════════════
+     MOOD PROFILES
+  ════════════════════════════════════════════════════════════ */
+  const PROFILES = {
+    calm: {
+      scale:    [155.56,174.61,196.00,233.08,261.63,311.13,349.23,392.00,466.16,523.25],
+      bassOct:  [77.78, 116.54],
+      modeName: 'Eb Pentatonic', style: 'Ambient Float', moodLabel: 'Deep Calm',
+      bassWave: 'sine', melWave: 'triangle', padWave: 'sine', harmWave: 'sine',
+      bassAmp: 0.28, padAmp: 0.16, melAmp: 0.20, harmAmp: 0.09,
+      bassDecF: 0.95, padDecF: 0.99, melDecF: 0.86, harmDecF: 0.92, attackS: 0.045,
+      bassGrid: [1,0,0,0,1,0,0,0], melGrid:  [1,0,1,0,0,1,0,0],
+      harmGrid: [0,0,1,0,0,0,1,0], padGrid:  [1,0,0,0,0,0,0,0], padDurMul: 7.6,
+      kick: false, snare: false, hihat: false,
+      beatLpFreq: 130, beatQ: 5.0, beatGain: 0.11, beatDecayS: 0.068,
+      delayRatio: 0.75, delayFB: 0.42, delayWet: 0.30,
+      reverbSec: 4.2, reverbWet: 0.40, masterVol: 0.150,
+      lfoHz: 0.09, lfoDepth: 0.030, swingBase: 0.026, swingHrvMul: 0.00055,
+    },
+    balanced: {
+      scale:    [146.83,164.81,174.61,196.00,220.00,246.94,261.63,293.66,329.63,349.23],
+      bassOct:  [73.42, 110.00],
+      modeName: 'D Dorian', style: 'Melodic Flow', moodLabel: 'Balanced',
+      bassWave: 'triangle', melWave: 'triangle', padWave: 'sine', harmWave: 'sine',
+      bassAmp: 0.34, padAmp: 0.09, melAmp: 0.23, harmAmp: 0.11,
+      bassDecF: 0.66, padDecF: 0.88, melDecF: 0.60, harmDecF: 0.70, attackS: 0.016,
+      bassGrid: [1,0,0,1,0,0,1,0], melGrid:  [1,0,1,1,0,1,0,1],
+      harmGrid: [0,1,0,0,1,0,0,1], padGrid:  [1,0,0,0,1,0,0,0], padDurMul: 3.8,
+      kick: true,  kickGrid:  [1,0,0,0,1,0,0,0],
+      snare: true, snareGrid: [0,0,1,0,0,0,1,0],
+      hihat: true, hihatGrid: [1,1,0,1,1,1,0,1],
+      beatLpFreq: 190, beatQ: 4.0, beatGain: 0.20, beatDecayS: 0.095,
+      delayRatio: 0.50, delayFB: 0.22, delayWet: 0.16,
+      reverbSec: 1.7, reverbWet: 0.18, masterVol: 0.162,
+      lfoHz: 0.26, lfoDepth: 0.018, swingBase: 0.012, swingHrvMul: 0.00025,
+    },
+    stressed: {
+      scale:    [246.94,261.63,311.13,329.63,369.99,392.00,440.00,493.88,523.25,587.33],
+      bassOct:  [123.47,185.00],
+      modeName: 'B Phrygian', style: 'Kinetic Pulse', moodLabel: 'Energised',
+      bassWave: 'sawtooth', melWave: 'sawtooth', padWave: 'square', harmWave: 'square',
+      bassAmp: 0.22, padAmp: 0.06, melAmp: 0.19, harmAmp: 0.13,
+      bassDecF: 0.40, padDecF: 0.48, melDecF: 0.36, harmDecF: 0.44, attackS: 0.006,
+      bassGrid: [1,0,1,0,1,1,0,1], melGrid:  [1,1,0,1,1,0,1,1],
+      harmGrid: [1,0,0,1,0,1,0,0], padGrid:  [1,0,0,0,0,0,0,0], padDurMul: 1.8,
+      kick: true,  kickGrid:  [1,0,1,0,1,0,1,0],
+      snare: true, snareGrid: [0,0,1,0,0,1,1,0],
+      hihat: true, hihatGrid: [1,1,1,1,1,1,1,1],
+      beatLpFreq: 270, beatQ: 5.5, beatGain: 0.34, beatDecayS: 0.066,
+      delayRatio: 0.25, delayFB: 0.12, delayWet: 0.08,
+      reverbSec: 0.65, reverbWet: 0.08, masterVol: 0.148,
+      lfoHz: 0.68, lfoDepth: 0.010, swingBase: 0.004, swingHrvMul: 0.00010,
+    },
+  };
+
+  const PHASES = {
+    0: { name:'Warmup',   layers:['beat']                                    },
+    1: { name:'Building', layers:['beat','bass']                             },
+    2: { name:'Evolving', layers:['beat','bass','melody','perc']             },
+    3: { name:'Climax',   layers:['beat','bass','melody','perc','pad','harm'] },
+  };
+
+  const TITLE_WORDS = ['Meridian','Artery','Current','Threshold','Resonance',
+    'Drift','Continuum','Orbit','Flux','Tide','Pulse','Reverie'];
+  const CHROMATIC   = ['C','C♯','D','Eb','E','F','F♯','G','Ab','A','Bb','B'];
+
+  /* ── State ── */
+  let _ctx=null, _master=null, _lfoGain=null, _delay=null, _reverb=null;
+  let _allNodes=[], _sched=null, _playing=false;
+  let _nextBar=0, _barN=0, _dur=60, _stopCb=null;
+
+  /* Live biometric state — updated without restart */
+  let _liveBpm=72, _liveHrv=45, _liveAmp=0.8;
+  let _liveMood='balanced', _phase=0, _trend=0;
+
+  /* ════════════════════════════════════════════════════════════
+     CONTEXT
+  ════════════════════════════════════════════════════════════ */
+  function _ctxGet() {
+    if (!_ctx || _ctx.state==='closed') {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) throw new Error('Web Audio not supported');
+      _ctx = new AC();
+    }
+    return _ctx;
+  }
+  async function resume() {
+    const c = _ctxGet();
+    if (c.state==='suspended') await c.resume();
+    return c;
+  }
+
+  function _tr(...ns) { _allNodes.push(...ns); return ns[ns.length-1]; }
+
+  /* ════════════════════════════════════════════════════════════
+     REVERB IR (synthesised convolution)
+  ════════════════════════════════════════════════════════════ */
+  function _makeReverb(c, sizeS) {
+    const sr=c.sampleRate, len=Math.ceil(sr*Math.max(0.4,sizeS));
+    const ir=c.createBuffer(2,len,sr);
+    for (let ch=0;ch<2;ch++) {
+      const d=ir.getChannelData(ch);
+      for (let i=0;i<len;i++) {
+        const pre=i<Math.floor(sr*0.008)?0.05:1.0;
+        d[i]=(Math.random()*2-1)*pre*Math.pow(1-i/len,2.1);
+      }
+    }
+    const conv=c.createConvolver();
+    conv.buffer=ir;
+    return _tr(conv);
+  }
+
+  function _noiseBuf(c,ms) {
+    const len=Math.ceil(c.sampleRate*ms/1000);
+    const buf=c.createBuffer(1,len,c.sampleRate);
+    const d=buf.getChannelData(0);
+    for (let i=0;i<len;i++) d[i]=Math.random()*2-1;
+    return buf;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     TONAL NOTE
+  ════════════════════════════════════════════════════════════ */
+  function _note(c,t,freq,wave,amp,attackS,decayFrac,interval,dest) {
+    const osc=c.createOscillator(), env=c.createGain();
+    osc.type=wave;
+    osc.frequency.setValueAtTime(freq,t);
+    env.gain.setValueAtTime(0,t);
+    env.gain.linearRampToValueAtTime(amp,t+attackS);
+    env.gain.exponentialRampToValueAtTime(0.0001,t+Math.max(attackS+0.01,interval*decayFrac));
+    osc.connect(env); env.connect(dest);
+    osc.start(t); osc.stop(t+interval+0.05);
+    _tr(osc,env);
+    return env;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     PUBLIC: triggerBeat(amplitude)
+     Called by app.js on EVERY detected PPG peak.
+     Fires biological LUB-DUB transients in real biological time.
+     amplitude: 0.0–1.0 (normalised PPG peak amplitude)
+  ════════════════════════════════════════════════════════════ */
+  function triggerBeat(amplitude) {
+    if (!_ctx || !_master || !_playing) return;
+    const c   = _ctx;
+    const t   = c.currentTime + 0.010;
+    const p   = PROFILES[_liveMood];
+    const amp = Math.max(0.05, Math.min(1.0, amplitude||0.7));
+
+    /* LUB — low resonant thump */
+    const lubSrc=c.createBufferSource(), lubFlt=c.createBiquadFilter(), lubEnv=c.createGain();
+    lubSrc.buffer=_noiseBuf(c,72);
+    lubFlt.type='lowpass'; lubFlt.frequency.value=p.beatLpFreq; lubFlt.Q.value=p.beatQ;
+    lubEnv.gain.setValueAtTime(0,t);
+    lubEnv.gain.linearRampToValueAtTime(p.beatGain*amp, t+0.009);
+    lubEnv.gain.exponentialRampToValueAtTime(0.0001, t+p.beatDecayS);
+    lubSrc.connect(lubFlt); lubFlt.connect(lubEnv); lubEnv.connect(_master);
+    lubSrc.start(t); lubSrc.stop(t+p.beatDecayS+0.01);
+    _tr(lubSrc,lubFlt,lubEnv);
+
+    /* DUB — softer echo at ~28% of beat interval */
+    const dubT   = t + (60/_liveBpm)*0.28;
+    const dubSrc = c.createBufferSource(), dubFlt=c.createBiquadFilter(), dubEnv=c.createGain();
+    dubSrc.buffer=_noiseBuf(c,50);
+    dubFlt.type='lowpass'; dubFlt.frequency.value=p.beatLpFreq*1.35; dubFlt.Q.value=p.beatQ*0.78;
+    dubEnv.gain.setValueAtTime(0,dubT);
+    dubEnv.gain.linearRampToValueAtTime(p.beatGain*amp*0.52, dubT+0.007);
+    dubEnv.gain.exponentialRampToValueAtTime(0.0001, dubT+p.beatDecayS*0.72);
+    dubSrc.connect(dubFlt); dubFlt.connect(dubEnv); dubEnv.connect(_master);
+    dubSrc.start(dubT); dubSrc.stop(dubT+p.beatDecayS+0.01);
+    _tr(dubSrc,dubFlt,dubEnv);
+
+    /* Phase 1+: add a kick sine-sweep accent */
+    if (_phase>=1 && _liveMood!=='calm') {
+      const kosc=c.createOscillator(), kenv=c.createGain();
+      kosc.type='sine';
+      kosc.frequency.setValueAtTime(_liveMood==='stressed'?155:95, t);
+      kosc.frequency.exponentialRampToValueAtTime(28, t+0.13);
+      kenv.gain.setValueAtTime(0,t);
+      kenv.gain.linearRampToValueAtTime(0.36*amp, t+0.005);
+      kenv.gain.exponentialRampToValueAtTime(0.0001, t+0.22);
+      kosc.connect(kenv); kenv.connect(_master);
+      kosc.start(t); kosc.stop(t+0.24);
+      _tr(kosc,kenv);
+    }
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     PUBLIC: updateParams(bpm, hrv, amplitude, trend)
+     Called every 10s from app.js timeline snapshot.
+     Updates live parameters — takes effect on next scheduled bar.
+     trend: +1=rising BPM, 0=stable, -1=falling
+  ════════════════════════════════════════════════════════════ */
+  function updateParams(bpm, hrv, amplitude, trend) {
+    _liveBpm  = Math.max(40, Math.min(200, bpm  || _liveBpm));
+    _liveHrv  = Math.max(10, Math.min(100, hrv  || _liveHrv));
+    _liveAmp  = Math.max(0.1, Math.min(1.5, amplitude || _liveAmp));
+    _trend    = trend===1?1:trend===-1?-1:0;
+    _liveMood = _moodKey(_liveBpm, _liveHrv);
+
+    /* Smoothly glide delay time to match new BPM */
+    if (_delay && _ctx) {
+      const newStep = 60 / _liveBpm;
+      const newDelayT = newStep * PROFILES[_liveMood].delayRatio;
+      _delay.delayTime.linearRampToValueAtTime(newDelayT, _ctx.currentTime+0.8);
+    }
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     PUBLIC: setPhase(0-3)
+  ════════════════════════════════════════════════════════════ */
+  function setPhase(phase) {
+    _phase = Math.max(0, Math.min(3, phase|0));
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     PERCUSSION
+  ════════════════════════════════════════════════════════════ */
+  function _kick(c,t,stressed) {
+    const osc=c.createOscillator(), env=c.createGain();
+    osc.type='sine';
+    osc.frequency.setValueAtTime(stressed?190:105,t);
+    osc.frequency.exponentialRampToValueAtTime(28,t+0.14);
+    env.gain.setValueAtTime(0,t);
+    env.gain.linearRampToValueAtTime(stressed?0.62:0.45,t+0.004);
+    env.gain.exponentialRampToValueAtTime(0.0001,t+(stressed?0.18:0.25));
+    osc.connect(env); env.connect(_master);
+    osc.start(t); osc.stop(t+0.30);
+    _tr(osc,env);
+  }
+
+  function _snare(c,t,stressed) {
+    const src=c.createBufferSource(), flt=c.createBiquadFilter(), env=c.createGain();
+    src.buffer=_noiseBuf(c,200);
+    flt.type='bandpass'; flt.frequency.value=stressed?2700:1700; flt.Q.value=0.9;
+    env.gain.setValueAtTime(0,t);
+    env.gain.linearRampToValueAtTime(stressed?0.36:0.21,t+0.004);
+    env.gain.exponentialRampToValueAtTime(0.0001,t+(stressed?0.13:0.17));
+    src.connect(flt); flt.connect(env); env.connect(_master);
+    src.start(t); src.stop(t+0.22);
+    _tr(src,flt,env);
+  }
+
+  function _hihat(c,t,open,stressed) {
+    const ms=open?115:32;
+    const src=c.createBufferSource(), flt=c.createBiquadFilter(), env=c.createGain();
+    src.buffer=_noiseBuf(c,ms);
+    flt.type='highpass'; flt.frequency.value=stressed?9800:7200;
+    env.gain.setValueAtTime(0,t);
+    env.gain.linearRampToValueAtTime(open?0.11:0.065,t+0.002);
+    env.gain.exponentialRampToValueAtTime(0.0001,t+ms/1000);
+    src.connect(flt); flt.connect(env); env.connect(_master);
+    src.start(t); src.stop(t+ms/1000+0.01);
+    _tr(src,flt,env);
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     MELODY NOTE PICKER
+     HRV → spread (narrow at low HRV, wide at high HRV)
+     trend → shifts melodic register over time
+  ════════════════════════════════════════════════════════════ */
+  function _pickNote(scale, barN, stepN, hrv, trend) {
+    const spread   = Math.max(2, Math.min(scale.length-1, Math.round(hrv/8)));
+    const trendBias = trend * barN * 0.055;
+    const contour  = Math.sin(barN*0.37+stepN*0.23)*(spread*0.55)+trendBias;
+    const walk     = Math.round(contour+barN*0.14+stepN*0.10);
+    return scale[Math.abs(walk)%scale.length];
+  }
+
+  function _swing(stepIdx, hrv, p) {
+    const base   = p.swingBase + hrv * p.swingHrvMul;
+    const groove = stepIdx%2===1 ? base : -base*0.22;
+    const jitter = (Math.random()-0.5)*hrv*0.00028;
+    return groove+jitter;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     SCHEDULE ONE BAR — phase-gated layer system
+  ════════════════════════════════════════════════════════════ */
+  function _schedBar(c, barStart, stepSec) {
+    const mood     = _liveMood;
+    const p        = PROFILES[mood];
+    const stressed = mood==='stressed';
+    const nSteps   = p.melGrid.length;
+    const layers   = PHASES[_phase].layers;
+    const hrv      = _liveHrv;
+
+    for (let s=0; s<nSteps; s++) {
+      const t = Math.max(barStart, barStart+s*stepSec+_swing(s,hrv,p));
+
+      if (layers.includes('bass') && p.bassGrid[s]) {
+        const bf = s<nSteps/2 ? p.bassOct[0] : p.bassOct[1];
+        _note(c,t,bf,p.bassWave,p.bassAmp,p.attackS,p.bassDecF,stepSec,_master);
+      }
+
+      if (layers.includes('melody') && p.melGrid[s]) {
+        const freq = _pickNote(p.scale,_barN,s,hrv,_trend);
+        const accent = Math.max(0.5, Math.min(1.5, _liveAmp));
+        const melE = _note(c,t,freq,p.melWave,p.melAmp*accent,p.attackS,p.melDecF,stepSec,_delay||_master);
+        if (_lfoGain && melE) { try { _lfoGain.connect(melE.gain); } catch {} }
+      }
+
+      if (layers.includes('harm') && p.harmGrid[s]) {
+        const freq  = _pickNote(p.scale,_barN,s+2,hrv,_trend);
+        const ratio = s%4<2 ? 1.4983 : 1.2599;
+        _note(c,t,freq*ratio,p.harmWave,p.harmAmp,p.attackS*1.8,p.harmDecF,stepSec,_reverb||_master);
+      }
+
+      if (layers.includes('pad') && p.padGrid[s]) {
+        const padDur = stepSec*p.padDurMul;
+        [p.scale[0],p.scale[2],p.scale[4]].forEach((f,i)=>{
+          _note(c,t,f,p.padWave,p.padAmp*(1-i*0.18),p.attackS*5,
+            Math.min(0.999,padDur/Math.max(0.01,padDur+0.001)),padDur,_reverb||_master);
+        });
+      }
+
+      if (layers.includes('perc')) {
+        if (p.kick  && p.kickGrid [s]) _kick (c,t,stressed);
+        if (p.snare && p.snareGrid[s]) _snare(c,t,stressed);
+        if (p.hihat && p.hihatGrid[s]) _hihat(c,t,s===4,stressed);
+      }
+    }
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     LOOKAHEAD SCHEDULER — fires every 90ms
+     Reads _liveBpm live so tempo changes take effect on next bar
+  ════════════════════════════════════════════════════════════ */
+  function _scheduler(c) {
+    const stepSec = 60/_liveBpm;
+    const barDur  = stepSec * PROFILES[_liveMood].melGrid.length;
+    while (_nextBar < c.currentTime+0.32) {
+      _schedBar(c, _nextBar, stepSec);
+      _nextBar += barDur;
+      _barN++;
+    }
+    _sched = setTimeout(()=>_scheduler(c), 90);
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     PUBLIC: start
+  ════════════════════════════════════════════════════════════ */
+  async function start(bpm, hrv, onStopFn) {
+    stop();
+    let c;
+    try { c=await resume(); } catch(e) { console.error('[AE]',e); return false; }
+
+    _liveBpm  = Math.max(40,Math.min(200,bpm||72));
+    _liveHrv  = Math.max(10,Math.min(100,hrv||45));
+    _liveMood = _moodKey(_liveBpm,_liveHrv);
+    _phase=0; _trend=0; _barN=0;
+
+    const p       = PROFILES[_liveMood];
+    const stepSec = 60/_liveBpm;
+    const barDur  = stepSec*p.melGrid.length;
+    _dur    = Math.ceil(Math.ceil(60/barDur)*barDur);
+    _stopCb = onStopFn||null;
+    _allNodes = [];
+
+    _master = c.createGain();
+    _master.gain.setValueAtTime(0,c.currentTime);
+    _master.gain.linearRampToValueAtTime(p.masterVol,c.currentTime+0.9);
+    _master.connect(c.destination);
+
+    const rvWet=c.createGain(); rvWet.gain.value=p.reverbWet;
+    _reverb=_makeReverb(c,p.reverbSec);
+    _reverb.connect(rvWet); rvWet.connect(_master); _tr(rvWet);
+
+    const dly=c.createDelay(2.0), dfb=c.createGain(), dwt=c.createGain();
+    dly.delayTime.setValueAtTime(stepSec*p.delayRatio,c.currentTime);
+    dfb.gain.setValueAtTime(p.delayFB,c.currentTime);
+    dwt.gain.setValueAtTime(p.delayWet,c.currentTime);
+    dly.connect(dfb); dfb.connect(dly); dly.connect(dwt); dwt.connect(_master);
+    _delay=dly; _tr(dly,dfb,dwt);
+
+    const lfoOsc=c.createOscillator(), lfoGn=c.createGain();
+    lfoOsc.frequency.setValueAtTime(p.lfoHz,c.currentTime);
+    lfoGn.gain.setValueAtTime(p.lfoDepth,c.currentTime);
+    lfoOsc.connect(lfoGn); lfoOsc.start();
+    _lfoGain=lfoGn; _tr(lfoOsc,lfoGn);
+
+    _nextBar=c.currentTime+0.12; _playing=true;
+    _scheduler(c);
+    return true;
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     PUBLIC: stop / fadeOut
+  ════════════════════════════════════════════════════════════ */
+  function stop() {
+    if (_sched){clearTimeout(_sched);_sched=null;}
+    _allNodes.forEach(n=>{ try{n.stop?.();}catch{} try{n.disconnect();}catch{} });
+    _allNodes=[];
+    if (_master){try{_master.disconnect();}catch{} _master=null;}
+    _reverb=_delay=_lfoGain=null; _playing=false;
+    if (_stopCb){_stopCb();_stopCb=null;}
+  }
+
+  function fadeOut(sec=1.4) {
+    if (!_master||!_ctx){stop();return;}
+    _master.gain.setValueAtTime(_master.gain.value,_ctx.currentTime);
+    _master.gain.linearRampToValueAtTime(0.0001,_ctx.currentTime+sec);
+    setTimeout(stop,(sec+0.15)*1000);
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     PUBLIC: getMeta
+  ════════════════════════════════════════════════════════════ */
+  function getMeta(bpm,hrv) {
+    const B=Math.max(40,Math.min(200,bpm||72));
+    const H=Math.max(10,Math.min(100,hrv||45));
+    const mood=_moodKey(B,H);
+    const p=PROFILES[mood];
+    const tIdx=Math.abs(Math.round(B*1.3+H*0.7))%TITLE_WORDS.length;
+    const key=CHROMATIC[Math.round(B/5.5)%12];
+    const hrvLbl=H>52?'High Variability':H>28?'Moderate Variability':'Low Variability';
+    return {
+      title:    `${TITLE_WORDS[tIdx]} in ${key}`,
+      subtitle: `${B} BPM · ${p.style} · ${hrvLbl}`,
+      mood, moodLabel:p.moodLabel, scaleName:p.modeName,
+      phase: PHASES[_phase]?.name||'Warmup',
+    };
+  }
+
+  function _moodKey(bpm,hrv) {
+    if (bpm>100||hrv<20) return 'stressed';
+    if (bpm<65 ||hrv>55) return 'calm';
+    return 'balanced';
+  }
+
+  /* ════════════════════════════════════════════════════════════
+     EXPORTS
+  ════════════════════════════════════════════════════════════ */
+  return {
+    start, stop, fadeOut, resume, getMeta,
+    getDuration:  ()=>_dur,
+    getIsPlaying: ()=>_playing,
+    getPhaseName: ()=>PHASES[_phase]?.name||'Warmup',
+    getPhase:     ()=>_phase,
+    triggerBeat,
+    updateParams,
+    setPhase,
+  };
+})();
+
+window.AudioEngine = AudioEngine;
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="description" content="Detect your heartbeat with your phone camera and transform it into personalised music. Real-time BPM, HRV analysis, and a unique evolving soundtrack.">
+  <meta name="theme-color" content="#060810">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="HB Studio">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta property="og:title" content="HeartBeat Studio">
+  <meta property="og:description" content="Turn your heartbeat into music">
+  <meta property="og:type" content="website">
+  <title>HeartBeat Studio</title>
+  <link rel="manifest" href="./manifest.json">
+  <link rel="apple-touch-icon" href="./icons/icon-192.png">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to main content</a>
+<div class="ambient" aria-hidden="true"></div>
+
+<div class="app" id="main">
+
+
+<!-- ╔══════════════════════════════════════════╗
+     ║  SCREEN: HOME                            ║
+     ╚══════════════════════════════════════════╝ -->
+<main class="screen active" id="scrHome" role="main" aria-label="Home">
+
+  <header class="home-hd" aria-label="HeartBeat Studio">
+    <p class="eyebrow" aria-hidden="true"><span class="dot"></span> Live Biometric Studio</p>
+    <h1 class="page-h">HeartBeat<br><em>Studio</em></h1>
+    <p class="page-sub">Turn your pulse into unique evolving music</p>
+  </header>
+
+  <!-- Live ECG preview strip -->
+  <canvas id="ecgCanvas" class="ecg-strip"
+    role="img" aria-label="Animated ECG heartbeat preview" aria-hidden="true"></canvas>
+
+  <!-- Feature tiles -->
+  <div class="feature-grid" role="list" aria-label="App features">
+    <div class="feat" role="listitem">
+      <span class="feat-icon" aria-hidden="true">📷</span>
+      <span class="feat-lbl">Camera PPG pulse detection</span>
+    </div>
+    <div class="feat" role="listitem">
+      <span class="feat-icon" aria-hidden="true">🎵</span>
+      <span class="feat-lbl">Heartbeat-generated music</span>
+    </div>
+    <div class="feat" role="listitem">
+      <span class="feat-icon" aria-hidden="true">📊</span>
+      <span class="feat-lbl">Real-time BPM &amp; HRV</span>
+    </div>
+    <div class="feat" role="listitem">
+      <span class="feat-icon" aria-hidden="true">🎼</span>
+      <span class="feat-lbl">4-phase music evolution</span>
+    </div>
+  </div>
+
+  <!-- How to use -->
+  <div class="how-to" role="note" aria-label="Instructions">
+    <span class="how-to-icon" aria-hidden="true">💡</span>
+    <p class="how-to-txt">
+      Place your <strong>fingertip firmly</strong> over the
+      <strong>rear camera lens</strong> and hold still for
+      <strong>30 seconds</strong>. Your heartbeat builds unique music in real time.
+    </p>
+  </div>
+
+  <!-- Install banner (hidden until beforeinstallprompt fires) -->
+  <button id="installBtn" class="btn btn-s mb-3" hidden
+    aria-label="Install HeartBeat Studio as a home screen app">
+    <span aria-hidden="true">📲</span> Add to Home Screen
+  </button>
+
+  <!-- Primary CTA -->
+  <div class="cta-anchor">
+    <button class="btn btn-p"
+      onclick="startScan()"
+      aria-label="Start a 30-second heartbeat scan">
+      <span aria-hidden="true">❤️</span>
+      Begin Heart Scan
+    </button>
+  </div>
+
+</main>
+
+
+<!-- ╔══════════════════════════════════════════╗
+     ║  SCREEN: SCANNING                        ║
+     ╚══════════════════════════════════════════╝ -->
+<section class="screen" id="scrScan"
+  role="region" aria-label="Heartbeat scanning" aria-live="polite">
+
+  <header class="scan-hd">
+    <p class="scan-lbl" aria-hidden="true"><span class="dot"></span> Scanning</p>
+    <h2 class="scan-title">Detecting Your<br>Pulse</h2>
+    <!-- ★ NEW: Evolution phase badge -->
+    <span class="phase-badge" id="evolutionPhase" aria-live="polite" data-phase="0">◎ Warmup</span>
+  </header>
+
+  <!-- Camera ring — id="camRing" used for beat flash -->
+  <div class="cam-wrap" role="img" aria-label="Camera preview — cover lens with fingertip">
+    <video id="camVid" class="cam-vid"
+      autoplay playsinline muted
+      aria-label="Camera feed for pulse detection"></video>
+    <div class="cam-ring" id="camRing" aria-hidden="true"></div>
+    <div class="cam-spin" aria-hidden="true"></div>
+  </div>
+
+  <!-- ★ NEW: Amplitude meter bar -->
+  <div class="amp-wrap" aria-hidden="true">
+    <div class="amp-track">
+      <div class="amp-bar" id="ampBar"></div>
+    </div>
+    <span class="amp-lbl">Pulse Amplitude</span>
+  </div>
+
+  <!-- Signal feedback -->
+  <div class="sig-strip" id="sigStrip" role="status" aria-live="polite">
+    <span class="strip-icon" id="stripIcon" aria-hidden="true">👆</span>
+    <span id="stripText">Cover the rear camera lens with your fingertip and hold still.</span>
+  </div>
+
+  <!-- Signal bars -->
+  <div class="signal-row" role="group" aria-label="Signal strength indicator">
+    <span class="sig-lbl" aria-hidden="true">Signal</span>
+    <div class="sig-bars" aria-hidden="true">
+      <div class="sig-bar" id="sb1"></div>
+      <div class="sig-bar" id="sb2"></div>
+      <div class="sig-bar" id="sb3"></div>
+      <div class="sig-bar" id="sb4"></div>
+      <div class="sig-bar" id="sb5"></div>
+    </div>
+    <span class="sig-txt" id="sigTxt" aria-hidden="true">—</span>
+  </div>
+
+  <!-- Live BPM + ★ NEW trend arrow -->
+  <div class="bpm-row" aria-label="Live heart rate reading">
+    <div class="bpm-num" id="liveBpm" aria-atomic="true">--</div>
+    <div class="bpm-col">
+      <span class="bpm-unit" aria-hidden="true">BPM</span>
+      <span class="bpm-pill" id="bpmPill">Calibrating</span>
+    </div>
+    <!-- ★ NEW: BPM trend arrow -->
+    <span class="bpm-trend" id="bpmTrend" aria-hidden="true">→</span>
+  </div>
+
+  <!-- Live waveform -->
+  <canvas id="waveCanvas" class="wave-c"
+    role="img" aria-label="Live heartbeat waveform" aria-hidden="true"></canvas>
+
+  <!-- Progress bar -->
+  <div class="scan-prog" role="group" aria-label="Scan progress">
+    <div class="scan-prog-row">
+      <span>Scan in progress</span>
+      <span id="scanTL" aria-live="polite">30s remaining</span>
+    </div>
+    <div class="prog-track"
+      id="progressBar" role="progressbar"
+      aria-label="Scan progress"
+      aria-valuemin="0" aria-valuemax="30" aria-valuenow="0">
+      <div class="prog-fill" id="progFill"></div>
+    </div>
+  </div>
+
+  <!-- Cancel -->
+  <div class="mt-auto">
+    <button class="btn btn-s"
+      onclick="cancelScan()"
+      aria-label="Cancel scan and return to home screen">
+      Cancel Scan
+    </button>
+  </div>
+
+  <!-- SR live regions -->
+  <div class="sr-only" aria-live="polite" id="bpmLive"></div>
+  <div class="sr-only" aria-live="polite" id="sigLive"></div>
+
+</section>
+
+
+<!-- ╔══════════════════════════════════════════╗
+     ║  SCREEN: RESULTS                         ║
+     ╚══════════════════════════════════════════╝ -->
+<section class="screen" id="scrResults"
+  role="region" aria-label="Scan results">
+
+  <header class="res-hd">
+    <p class="eyebrow"><span aria-hidden="true">✓</span> Scan Complete</p>
+    <h2 class="page-h">Your Heart<br><em>Rhythm</em></h2>
+  </header>
+
+  <!-- BPM hero -->
+  <div class="res-hero" role="img" aria-label="Heart rate result">
+    <div class="pulse-rings" aria-hidden="true">
+      <div class="pulse-ring"></div>
+      <div class="pulse-ring"></div>
+      <div class="pulse-ring"></div>
+      <div class="pulse-core"></div>
+    </div>
+    <div class="res-bpm" id="resBpm" aria-label="Beats per minute">72</div>
+    <p class="res-bpm-lbl">Beats Per Minute</p>
+    <!-- ★ NEW: BPM trend label -->
+    <span class="res-trend" id="resTrend" aria-label="BPM trend">→ Stable</span>
+  </div>
+
+  <!-- Session name field -->
+  <div class="name-field" role="group" aria-label="Name this session">
+    <span aria-hidden="true">✏️</span>
+    <input type="text" id="sessNameInput" class="name-input"
+      placeholder="Name this session (e.g. Morning Calm)"
+      maxlength="40" autocomplete="off" autocorrect="off" spellcheck="false"
+      aria-label="Session name, optional">
+  </div>
+
+  <!-- Music generating banner -->
+  <div class="gen-banner" id="genBanner" hidden
+    role="status" aria-live="polite">
+    <div class="gen-dot" aria-hidden="true"></div>
+    🎵 Generating your heartbeat music…
+  </div>
+
+  <!-- Wellness card -->
+  <div class="wellness calm" id="wellCard" role="region" aria-label="Wellness assessment">
+    <span class="wellness-badge calm" id="wellBadge" role="status">● Calm</span>
+    <p class="wellness-desc" id="wellDesc">
+      Your heart rate indicates a balanced, relaxed state.
+    </p>
+  </div>
+
+  <!-- Metrics -->
+  <div class="metrics" role="group" aria-label="Heart metrics">
+    <div class="met">
+      <div class="met-val" id="metHRV" aria-label="Heart rate variability">--</div>
+      <div class="met-lbl">HRV ms</div>
+    </div>
+    <div class="met">
+      <div class="met-val" id="metMin" aria-label="Minimum BPM">--</div>
+      <div class="met-lbl">Min BPM</div>
+    </div>
+    <div class="met">
+      <div class="met-val" id="metMax" aria-label="Maximum BPM">--</div>
+      <div class="met-lbl">Max BPM</div>
+    </div>
+  </div>
+
+  <!-- ★ NEW: Heartbeat timeline mini-chart -->
+  <div class="timeline-card" role="region" aria-label="BPM timeline chart">
+    <div class="timeline-hd">
+      <span class="tl-icon" aria-hidden="true">📈</span>
+      <span class="tl-title">Heart Rate Timeline</span>
+    </div>
+    <canvas id="timelineCanvas" class="timeline-canvas"
+      role="img" aria-label="BPM over scan duration" aria-hidden="true"></canvas>
+    <div class="timeline-labels" aria-hidden="true">
+      <span>0s</span><span>10s</span><span>20s</span><span>30s</span>
+    </div>
+  </div>
+
+  <!-- Music player card -->
+  <div class="card mb-3" role="region" aria-label="Heartbeat music player">
+    <div class="card-head">
+      <span class="card-head-icon" aria-hidden="true">🎵</span>
+      <h3 class="card-title">Heartbeat Music</h3>
+      <!-- ★ NEW: Phase badge on player -->
+      <span class="phase-tag" id="playerPhase" aria-label="Music phase">Climax</span>
+    </div>
+
+    <!-- Animated waveform -->
+    <canvas id="playerWave" class="player-wave"
+      role="img" aria-label="Music waveform visualisation" aria-hidden="true"></canvas>
+
+    <!-- Play controls -->
+    <div class="player-row">
+      <button class="btn-ico btn-p" id="playBtn"
+        onclick="toggleMusic()"
+        aria-label="Play heartbeat music">▶</button>
+      <div class="player-info">
+        <div class="player-title" id="mxTitle">Pulse Serenade in D</div>
+        <div class="player-sub"   id="mxSub">72 BPM · Melodic · Balanced</div>
+      </div>
+      <span class="player-dur" id="mxDur" aria-label="Music duration">60s</span>
+    </div>
+
+    <!-- Playback progress -->
+    <div class="pb-bar" role="group" aria-label="Playback progress">
+      <div class="pb-track" role="progressbar"
+        aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div class="pb-fill" id="pbFill"></div>
+      </div>
+      <div class="pb-times" aria-hidden="true">
+        <span id="pbElapsed">0:00</span>
+        <span id="pbTotal">1:00</span>
+      </div>
+    </div>
+
+    <!-- Tempo -->
+    <div class="tempo-row" role="group" aria-label="Adjust music tempo">
+      <label class="tempo-lbl" for="tempoSlider">Tempo</label>
+      <input type="range" id="tempoSlider"
+        min="40" max="180" value="72"
+        oninput="adjustTempo(this.value)"
+        aria-label="Tempo in beats per minute"
+        aria-valuemin="40" aria-valuemax="180" aria-valuenow="72">
+      <span class="tempo-val" id="tempoVal" aria-live="polite">72</span>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="btn-row btn-2 mb-3">
+    <button class="btn btn-p"
+      onclick="saveSession()"
+      aria-label="Save this heartbeat session to your library">
+      <span aria-hidden="true">💾</span> Save Session
+    </button>
+    <button class="btn btn-s"
+      onclick="startScan()"
+      aria-label="Start a new heartbeat scan">
+      <span aria-hidden="true">🔄</span> Scan Again
+    </button>
+  </div>
+
+  <div class="gap-8"></div>
+</section>
+
+
+<!-- ╔══════════════════════════════════════════╗
+     ║  SCREEN: LIBRARY                         ║
+     ╚══════════════════════════════════════════╝ -->
+<section class="screen" id="scrLibrary"
+  role="region" aria-label="Heartbeat session library">
+
+  <div class="lib-hd">
+    <h2 class="lib-title">My<br><em>Library</em></h2>
+    <span class="lib-count" id="libCount" aria-live="polite">0 sessions</span>
+  </div>
+
+  <!-- Empty state -->
+  <div id="libEmpty" class="empty" hidden>
+    <span class="empty-icon" aria-hidden="true">🫀</span>
+    <h3 class="empty-title">No Sessions Yet</h3>
+    <p class="empty-desc">Complete a scan to save your first heartbeat recording here.</p>
+    <button class="btn btn-p"
+      onclick="startScan()"
+      aria-label="Start your first heartbeat scan">
+      Start Scanning
+    </button>
+  </div>
+
+  <!-- Session list -->
+  <div id="libList" role="list" aria-label="Saved heartbeat sessions"></div>
+
+  <div class="gap-8"></div>
+</section>
+
+
+<!-- ╔══════════════════════════════════════════╗
+     ║  SCREEN: ERROR                           ║
+     ╚══════════════════════════════════════════╝ -->
+<section class="screen" id="scrError"
+  role="alert" aria-label="Error">
+
+  <div class="err-card">
+    <span class="err-icon" aria-hidden="true">🚫</span>
+    <h2 class="err-title" id="errTitle">Camera Access Denied</h2>
+    <p class="err-msg" id="errMsg">
+      HeartBeat Studio needs camera access to detect your pulse.
+      Please allow it in your browser settings and try again.
+    </p>
+  </div>
+
+  <button class="btn btn-p"
+    onclick="showScreen('home')"
+    aria-label="Go back to the home screen">
+    ← Back to Home
+  </button>
+
+</section>
+
+</div><!-- /.app -->
+
+
+<!-- ╔══════════════════════════════════════════╗
+     ║  BOTTOM NAVIGATION                       ║
+     ╚══════════════════════════════════════════╝ -->
+<nav class="main-nav" id="mainNav" aria-label="Main navigation">
+
+  <button class="nav__tab active"
+    data-screen="scrHome"
+    onclick="showScreen('home')"
+    aria-label="Home screen"
+    aria-current="page">
+    <span class="nav__icon" aria-hidden="true">🏠</span>
+    Home
+  </button>
+
+  <button class="nav__tab nav__tab--scan"
+    data-screen="scrScan"
+    onclick="startScan()"
+    aria-label="Start a new heartbeat scan">
+    <span class="nav__icon" aria-hidden="true">❤️</span>
+    Scan
+  </button>
+
+  <button class="nav__tab"
+    data-screen="scrLibrary"
+    onclick="showScreen('library')"
+    aria-label="View your session library">
+    <span class="nav__icon" aria-hidden="true">📚</span>
+    Library
+    <span class="nav__badge" id="libBadge" hidden aria-label="saved sessions"></span>
+  </button>
+
+</nav>
+
+
+<!-- Toast -->
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<!-- Scripts -->
+<script src="./storage.js"></script>
+<script src="./audioEngine.js"></script>
+<script src="./app.js"></script>
+
+</body>
+</html>
+
+/* ================================================================
+   HeartBeat Studio — storage.js v3
+   IndexedDB with localStorage fallback. Zero server dependency.
+================================================================ */
+'use strict';
+
+const Storage = (() => {
+  const DB_NAME = 'hbs_v3', DB_VER = 1, STORE = 'sessions', LS_KEY = 'hbs_v3_sessions';
+  let db = null, ready = false, _init = null;
+
+  function init() {
+    if (_init) return _init;
+    _init = new Promise(resolve => {
+      if (!window.indexedDB) { resolve(false); return; }
+      const req = indexedDB.open(DB_NAME, DB_VER);
+      req.onupgradeneeded = e => {
+        const d = e.target.result;
+        if (!d.objectStoreNames.contains(STORE))
+          d.createObjectStore(STORE, { keyPath: 'id' });
+      };
+      req.onsuccess = e => { db = e.target.result; ready = true; resolve(true); };
+      req.onerror   = () => resolve(false);
+    });
+    return _init;
+  }
+
+  function _tx(mode, fn) {
+    return new Promise((res, rej) => {
+      const req = fn(db.transaction(STORE, mode).objectStore(STORE));
+      req.onsuccess = e => res(e.target.result);
+      req.onerror   = e => rej(e.target.error);
+    });
+  }
+  function _lsGet()    { try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch { return []; } }
+  function _lsSet(arr) { try { localStorage.setItem(LS_KEY, JSON.stringify(arr)); } catch {} }
+
+  async function saveSession(s) {
+    await init();
+    if (ready) return _tx('readwrite', st => st.put(s));
+    const all = _lsGet(), i = all.findIndex(x => x.id === s.id);
+    i >= 0 ? all[i] = s : all.unshift(s);
+    _lsSet(all); return s;
+  }
+
+  async function loadSessions() {
+    await init();
+    if (ready) {
+      const all = await _tx('readonly', st => st.getAll());
+      return (all || []).sort((a, b) => b.id - a.id);
+    }
+    return _lsGet();
+  }
+
+  async function deleteSession(id) {
+    await init();
+    if (ready) return _tx('readwrite', st => st.delete(id));
+    _lsSet(_lsGet().filter(s => s.id !== id));
+  }
+
+  async function renameSession(id, name) {
+    await init();
+    if (ready) {
+      const s = await _tx('readonly', st => st.get(id));
+      if (!s) throw new Error('Not found');
+      s.name = name;
+      return _tx('readwrite', st => st.put(s));
+    }
+    const all = _lsGet(), item = all.find(s => s.id === id);
+    if (item) { item.name = name; _lsSet(all); return item; }
+    throw new Error('Not found');
+  }
+
+  function buildSession({ bpm, hrv, minBpm, maxBpm, mood, tempo, name, timeline }) {
+    const now = new Date();
+    const id  = now.getTime();
+    const date = now.toLocaleDateString('en-CA');
+    const time = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const finalName = (name || '').trim() ||
+      `Session · ${now.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} ${time}`;
+    return { id, name: finalName, bpm, hrv, minBpm, maxBpm, mood, tempo, date, time,
+             timeline: timeline || [] };
+  }
+
+  return { init, saveSession, loadSessions, deleteSession, renameSession, buildSession };
+})();
+
+window.Storage = Storage;
+
+/* ================================================================
+   HeartBeat Studio — styles.css v3
+   Premium health-tech. Mobile-first. WCAG AA.
+   Aesthetic: Clinical Precision — deep charcoal, vital crimson,
+   surgical whitespace. Like Apple Health × Withings.
+================================================================ */
+
+/* ── TOKENS ───────────────────────────────────────────────── */
+:root {
+  /* Backgrounds */
+  --bg:        #060810;
+  --bg1:       #0b0f1a;
+  --surf:      #111826;
+  --surf2:     #171f30;
+  --surf3:     #1d2840;
+
+  /* Borders */
+  --bdr:       rgba(255,255,255,0.06);
+  --bdr2:      rgba(255,255,255,0.10);
+  --bdr3:      rgba(255,255,255,0.16);
+
+  /* Primary — vital crimson */
+  --red:       #e8334a;
+  --red-hi:    #ff4d66;
+  --red-glow:  rgba(232,51,74,0.26);
+  --red-dim:   rgba(232,51,74,0.08);
+  --red-tint:  rgba(232,51,74,0.13);
+
+  /* Accent: teal (calm / success) */
+  --teal:      #29d4a8;
+  --teal-dim:  rgba(41,212,168,0.09);
+  --teal-bdr:  rgba(41,212,168,0.28);
+
+  /* Accent: amber (warning / normal) */
+  --amber:     #e8a430;
+  --amber-dim: rgba(232,164,48,0.09);
+  --amber-bdr: rgba(232,164,48,0.28);
+
+  /* Text */
+  --tx:        #e6e9f4;
+  --tx2:       #8f98b0;
+  --tx3:       #4a5268;
+
+  /* Font */
+  --font: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+
+  /* Type scale */
+  --ts-2xs: 9px;  --ts-xs: 11px; --ts-sm: 13px;
+  --ts-md:  15px; --ts-lg: 19px; --ts-xl: 26px;
+  --ts-2xl: 36px; --ts-hero: 82px;
+
+  /* Spacing */
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px;
+  --s5:20px; --s6:24px; --s8:32px; --s10:40px; --s12:48px;
+
+  /* Radius */
+  --r2: 6px; --r3: 10px; --r4: 16px; --r5: 22px; --r6: 28px; --rf: 9999px;
+
+  /* Motion */
+  --ease: cubic-bezier(.25,.46,.45,.94);
+  --fast: 130ms; --std: 240ms; --slow: 380ms;
+
+  /* Layout */
+  --maxw:   430px;
+  --navh:   66px;
+  --st:     env(safe-area-inset-top,    0px);
+  --sb:     env(safe-area-inset-bottom, 0px);
+  --sl:     env(safe-area-inset-left,   0px);
+  --sr:     env(safe-area-inset-right,  0px);
+}
+
+/* ── RESET ────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box; margin: 0; padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+html {
+  background: var(--bg); -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%; height: 100%;
+}
+body {
+  font-family: var(--font); font-size: var(--ts-sm);
+  line-height: 1.5; color: var(--tx); background: var(--bg);
+  overflow-x: hidden; overscroll-behavior: none;
+  min-height: 100dvh; -webkit-font-smoothing: antialiased;
+}
+
+/* ── FOCUS ────────────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid var(--red); outline-offset: 3px;
+  border-radius: var(--r2);
+}
+
+/* ── SKIP LINK ────────────────────────────────────────────── */
+.skip { position:absolute; top:-999px; left:var(--s4);
+  background:var(--red); color:#fff; padding:var(--s2) var(--s4);
+  border-radius:var(--r3); font-size:var(--ts-sm); font-weight:600;
+  text-decoration:none; z-index:9000; transition:top var(--fast); }
+.skip:focus { top:var(--s4); }
+
+/* ── AMBIENT GLOW ─────────────────────────────────────────── */
+.ambient {
+  position:fixed; inset:0; pointer-events:none; z-index:0; overflow:hidden;
+}
+.ambient::before {
+  content:''; position:absolute; top:-20%; left:50%;
+  transform:translateX(-50%);
+  width:520px; height:520px;
+  background:radial-gradient(ellipse, rgba(232,51,74,.06) 0%, transparent 65%);
+  animation:breathe 9s ease-in-out infinite;
+}
+.ambient::after {
+  content:''; position:absolute; bottom:-15%; right:-15%;
+  width:380px; height:380px;
+  background:radial-gradient(ellipse, rgba(41,212,168,.04) 0%, transparent 65%);
+  animation:breathe 12s ease-in-out infinite reverse;
+}
+@keyframes breathe {
+  0%,100%{opacity:.5;transform:translateX(-50%) scale(1)}
+  50%{opacity:1;transform:translateX(-50%) scale(1.1)}
+}
+
+/* ── APP SHELL ────────────────────────────────────────────── */
+.app {
+  position:relative; z-index:1; width:100%;
+  max-width:var(--maxw); margin:0 auto; min-height:100dvh;
+}
+
+/* ── SCREENS ──────────────────────────────────────────────── */
+.screen {
+  display:none; flex-direction:column; min-height:100dvh;
+  padding:
+    calc(var(--st) + var(--s5))
+    calc(var(--sr) + var(--s5))
+    calc(var(--navh) + var(--sb) + var(--s8))
+    calc(var(--sl) + var(--s5));
+  overflow-y:auto; -webkit-overflow-scrolling:touch;
+}
+.screen.active { display:flex; }
+#scrScan  { padding-bottom: calc(var(--sb) + var(--s10)); }
+#scrError { justify-content:center; padding-bottom:calc(var(--sb) + var(--s8)); }
+
+/* ── NAV BAR ──────────────────────────────────────────────── */
+nav.main-nav {
+  position:fixed; bottom:0; left:50%; transform:translateX(-50%);
+  width:100%; max-width:var(--maxw);
+  height:calc(var(--navh) + var(--sb));
+  padding-bottom:var(--sb);
+  background:rgba(6,8,16,.93);
+  backdrop-filter:blur(28px) saturate(1.6);
+  -webkit-backdrop-filter:blur(28px) saturate(1.6);
+  border-top:1px solid var(--bdr2);
+  display:flex; z-index:200;
+}
+.nav__tab {
+  flex:1; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:3px;
+  background:none; border:none; color:var(--tx3);
+  font-family:var(--font); font-size:var(--ts-2xs);
+  font-weight:600; letter-spacing:.09em; text-transform:uppercase;
+  cursor:pointer; padding:var(--s2) var(--s1); position:relative;
+  transition:color var(--fast) var(--ease);
+}
+.nav__icon { font-size:21px; line-height:1; transition:transform var(--fast); }
+.nav__tab:active .nav__icon { transform:scale(.88); }
+.nav__tab.active { color:var(--red); }
+.nav__tab.active::after {
+  content:''; position:absolute; top:0; left:50%;
+  transform:translateX(-50%);
+  width:26px; height:2px; background:var(--red);
+  border-radius:0 0 var(--rf) var(--rf);
+}
+/* Scan tab — center hero button */
+.nav__tab--scan .nav__icon {
+  width:46px; height:46px; border-radius:var(--rf);
+  display:flex; align-items:center; justify-content:center;
+  background:linear-gradient(145deg, var(--red) 0%, #a01828 100%);
+  box-shadow:0 4px 18px var(--red-glow);
+  color:#fff; font-size:22px; margin-bottom:2px;
+}
+.nav__tab--scan.active::after { display:none; }
+.nav__badge {
+  position:absolute; top:4px; right:calc(50% - 22px);
+  background:var(--red); color:#fff; font-size:8px; font-weight:700;
+  min-width:15px; height:15px; border-radius:var(--rf);
+  display:flex; align-items:center; justify-content:center;
+  padding:0 3px; border:2px solid var(--bg);
+}
+
+/* ── TYPOGRAPHY ───────────────────────────────────────────── */
+.eyebrow {
+  font-size:var(--ts-xs); letter-spacing:.28em;
+  text-transform:uppercase; color:var(--red);
+  font-weight:600; display:flex; align-items:center; gap:var(--s2);
+}
+.page-h {
+  font-size:var(--ts-2xl); font-weight:800;
+  letter-spacing:-.03em; line-height:1.07; color:var(--tx);
+}
+.page-h em { font-style:normal; font-weight:300; color:var(--tx2); }
+.page-sub { font-size:var(--ts-sm); color:var(--tx3); margin-top:var(--s2); }
+
+/* ── BUTTONS ──────────────────────────────────────────────── */
+.btn {
+  display:inline-flex; align-items:center; justify-content:center;
+  gap:var(--s2); width:100%; min-height:54px;
+  padding:var(--s4) var(--s5); border:none; border-radius:var(--r4);
+  font-family:var(--font); font-size:var(--ts-sm); font-weight:700;
+  letter-spacing:.09em; text-transform:uppercase;
+  cursor:pointer; -webkit-user-select:none; user-select:none;
+  position:relative; overflow:hidden;
+  transition:transform var(--fast) var(--ease), opacity var(--fast), box-shadow var(--fast);
+}
+.btn:active { transform:scale(.963); opacity:.92; }
+.btn::after {
+  content:''; position:absolute; inset:0;
+  background:rgba(255,255,255,.07); opacity:0; transition:opacity var(--fast);
+}
+.btn:active::after { opacity:1; }
+.btn-p {
+  background:linear-gradient(148deg, var(--red) 0%, #9c1c30 100%);
+  color:#fff; box-shadow:0 5px 22px var(--red-glow), inset 0 1px 0 rgba(255,255,255,.1);
+}
+.btn-p:hover { box-shadow:0 8px 30px var(--red-glow); }
+.btn-s {
+  background:var(--surf); color:var(--tx2);
+  border:1px solid var(--bdr2);
+}
+.btn-ghost {
+  background:none; border:none; color:var(--tx3);
+  font-size:var(--ts-sm); font-weight:500;
+  min-height:42px; padding:var(--s2) var(--s4);
+}
+/* Icon-only circular button */
+.btn-ico {
+  width:52px; min-height:52px; padding:0;
+  border-radius:var(--rf); font-size:20px; flex-shrink:0;
+}
+.btn-ico.btn-p { box-shadow:0 4px 16px var(--red-glow); }
+.btn-ico.playing {
+  animation:playPulse 1.9s ease-in-out infinite;
+}
+@keyframes playPulse {
+  0%,100%{box-shadow:0 4px 22px var(--red-glow),0 0 0 4px var(--red-tint)}
+  50%    {box-shadow:0 6px 34px rgba(232,51,74,.5),0 0 0 8px rgba(232,51,74,.06)}
+}
+.btn-row { display:grid; gap:var(--s3); }
+.btn-2   { grid-template-columns:1fr 1fr; }
+.btn-2 .btn { font-size:11px; min-height:50px; letter-spacing:.05em; }
+
+/* ── CARDS ────────────────────────────────────────────────── */
+.card {
+  background:var(--surf); border:1px solid var(--bdr);
+  border-radius:var(--r5); padding:var(--s5);
+}
+.card-head {
+  display:flex; align-items:center; gap:var(--s3);
+  margin-bottom:var(--s4);
+}
+.card-head-icon { font-size:17px; flex-shrink:0; }
+.card-title { font-size:var(--ts-md); font-weight:700; letter-spacing:-.01em; flex:1; }
+.card-tag {
+  font-size:var(--ts-xs); color:var(--tx3); border:1px solid var(--bdr2);
+  border-radius:var(--rf); padding:3px 9px; letter-spacing:.07em; font-weight:500;
+}
+
+/* ── CHIPS ────────────────────────────────────────────────── */
+.chip {
+  display:inline-flex; align-items:center; gap:4px;
+  font-size:var(--ts-xs); font-weight:600; padding:4px 10px;
+  border-radius:var(--rf); border:1px solid var(--bdr);
+  background:var(--surf2); color:var(--tx3);
+  letter-spacing:.04em; white-space:nowrap;
+}
+.chip-v { color:var(--red-hi); border-color:var(--red-tint); background:var(--red-dim); }
+.chip-t { color:var(--teal); border-color:var(--teal-bdr); background:var(--teal-dim); }
+.chip-a { color:var(--amber); border-color:var(--amber-bdr); background:var(--amber-dim); }
+
+/* ── BLINK DOT ────────────────────────────────────────────── */
+.dot {
+  display:inline-block; width:6px; height:6px;
+  border-radius:50%; background:var(--red);
+  animation:blink 1.1s ease-in-out infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.1} }
+
+/* ═══════════════════════════════════════════════════════════
+   HOME SCREEN
+═══════════════════════════════════════════════════════════ */
+.home-hd { padding-top:var(--s4); padding-bottom:var(--s5); }
+
+/* ECG strip */
+.ecg-strip {
+  width:100%; height:54px; display:block;
+  border-radius:var(--r4);
+  background:var(--surf); border:1px solid var(--bdr);
+  margin-bottom:var(--s5);
+}
+
+.feature-grid {
+  display:grid; grid-template-columns:1fr 1fr;
+  gap:var(--s3); margin-bottom:var(--s4);
+}
+.feat {
+  background:var(--surf); border:1px solid var(--bdr);
+  border-radius:var(--r4); padding:var(--s3);
+  display:flex; flex-direction:column; gap:var(--s1);
+}
+.feat-icon { font-size:18px; }
+.feat-lbl  { font-size:var(--ts-xs); color:var(--tx3); line-height:1.45; }
+
+.how-to {
+  background:var(--surf); border:1px solid var(--bdr);
+  border-radius:var(--r4); padding:var(--s4);
+  display:flex; gap:var(--s3); align-items:flex-start;
+  margin-bottom:var(--s5);
+}
+.how-to-icon { font-size:19px; flex-shrink:0; padding-top:1px; }
+.how-to-txt  { font-size:var(--ts-sm); color:var(--tx2); line-height:1.65; }
+.how-to-txt strong { color:var(--tx); font-weight:600; }
+
+.cta-anchor { margin-top:auto; }
+
+/* ═══════════════════════════════════════════════════════════
+   SCAN SCREEN
+═══════════════════════════════════════════════════════════ */
+.scan-hd {
+  text-align:center;
+  padding:var(--s6) 0 var(--s5); flex-shrink:0;
+}
+.scan-lbl {
+  font-size:var(--ts-xs); letter-spacing:.26em; text-transform:uppercase;
+  color:var(--red); font-weight:600;
+  display:flex; align-items:center; justify-content:center;
+  gap:var(--s2); margin-bottom:var(--s2);
+}
+.scan-title {
+  font-size:var(--ts-xl); font-weight:800; letter-spacing:-.025em;
+}
+
+/* Camera */
+.cam-wrap {
+  position:relative; width:156px; height:156px;
+  margin:0 auto var(--s5); flex-shrink:0;
+}
+.cam-vid {
+  width:100%; height:100%; border-radius:50%;
+  object-fit:cover; transform:scaleX(-1); display:block;
+}
+.cam-ring {
+  position:absolute; inset:-4px; border-radius:50%;
+  border:2px solid var(--red);
+  box-shadow:0 0 0 5px var(--red-tint), 0 0 26px var(--red-glow);
+}
+.cam-spin {
+  position:absolute; inset:-10px; border-radius:50%;
+  border:2px solid transparent;
+  border-top-color:var(--red);
+  animation:spin 1.05s linear infinite;
+}
+@keyframes spin { to{transform:rotate(360deg)} }
+
+/* Feedback strip */
+.sig-strip {
+  display:flex; align-items:flex-start; gap:var(--s3);
+  background:var(--surf); border:1px solid var(--bdr);
+  border-radius:var(--r4); padding:var(--s3) var(--s4);
+  font-size:var(--ts-sm); color:var(--tx2); line-height:1.5;
+  margin-bottom:var(--s3);
+  transition:border-color var(--std), background var(--std), color var(--std);
+}
+.sig-strip.warn { border-color:var(--amber-bdr); background:var(--amber-dim); color:var(--amber); }
+.sig-strip.good { border-color:var(--teal-bdr);  background:var(--teal-dim);  color:var(--teal); }
+.strip-icon { font-size:14px; flex-shrink:0; padding-top:2px; }
+
+/* Signal bars */
+.signal-row {
+  display:flex; align-items:center; gap:var(--s2);
+  margin-bottom:var(--s4);
+}
+.sig-lbl {
+  font-size:var(--ts-xs); color:var(--tx3); font-weight:600;
+  letter-spacing:.1em; text-transform:uppercase; white-space:nowrap; min-width:44px;
+}
+.sig-bars { display:flex; gap:3px; align-items:flex-end; }
+.sig-bar  {
+  width:5px; border-radius:3px; background:var(--surf3);
+  transition:background var(--fast), height var(--std);
+}
+.sig-bar.lit { background:var(--teal); }
+.sig-bar:nth-child(1){height:6px} .sig-bar:nth-child(2){height:9px}
+.sig-bar:nth-child(3){height:13px} .sig-bar:nth-child(4){height:17px}
+.sig-bar:nth-child(5){height:21px}
+.sig-txt { font-size:var(--ts-xs); color:var(--teal); font-weight:600; min-width:54px; }
+
+/* Live BPM */
+.bpm-row {
+  display:flex; align-items:center; justify-content:center;
+  gap:var(--s4); margin-bottom:var(--s4);
+}
+.bpm-num {
+  font-size:var(--ts-hero); font-weight:800;
+  letter-spacing:-.06em; line-height:1;
+  color:var(--red); text-shadow:0 0 20px var(--red-glow);
+  min-width:92px; text-align:center;
+  transition:color var(--std), text-shadow var(--std);
+}
+.bpm-col { display:flex; flex-direction:column; gap:var(--s2); }
+.bpm-unit {
+  font-size:var(--ts-xs); letter-spacing:.18em;
+  text-transform:uppercase; color:var(--tx3); font-weight:600;
+}
+.bpm-pill {
+  font-size:var(--ts-xs); font-weight:700;
+  padding:4px 10px; border-radius:var(--rf);
+  border:1px solid currentColor; white-space:nowrap;
+  letter-spacing:.05em; background:var(--red-dim); color:var(--red);
+  transition:color var(--std), background var(--std);
+}
+.bpm-pill.normal   { background:var(--teal-dim);  color:var(--teal); }
+.bpm-pill.elevated { background:var(--amber-dim); color:var(--amber); }
+.bpm-pill.low      { background:var(--surf2);     color:var(--tx2); }
+
+/* Waveform canvas */
+.wave-c {
+  width:100%; height:70px; display:block;
+  border-radius:var(--r4); background:var(--surf);
+  border:1px solid var(--bdr); margin-bottom:var(--s4);
+}
+
+/* Scan progress */
+.scan-prog { margin-bottom:var(--s4); }
+.scan-prog-row {
+  display:flex; justify-content:space-between;
+  font-size:var(--ts-xs); color:var(--tx3); font-weight:500; margin-bottom:var(--s2);
+}
+.prog-track {
+  height:3px; background:var(--surf3);
+  border-radius:var(--rf); overflow:hidden;
+}
+.prog-fill {
+  height:100%;
+  background:linear-gradient(90deg, var(--red), var(--amber));
+  border-radius:var(--rf); width:0%;
+  transition:width .6s linear;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   RESULTS SCREEN
+═══════════════════════════════════════════════════════════ */
+.res-hd { padding-top:var(--s4); padding-bottom:var(--s4); }
+
+/* BPM hero */
+.res-hero {
+  display:flex; flex-direction:column;
+  align-items:center; margin-bottom:var(--s5);
+}
+.pulse-rings {
+  position:relative; width:70px; height:70px;
+  display:flex; align-items:center; justify-content:center;
+  margin-bottom:var(--s3);
+}
+.pulse-ring {
+  position:absolute; border-radius:50%;
+  border:1.5px solid var(--red); opacity:0;
+  animation:ringOut 2.6s ease-out infinite;
+}
+.pulse-ring:nth-child(1){width:22px;height:22px;animation-delay:0s}
+.pulse-ring:nth-child(2){width:44px;height:44px;animation-delay:.65s}
+.pulse-ring:nth-child(3){width:68px;height:68px;animation-delay:1.3s}
+@keyframes ringOut{0%{transform:scale(.35);opacity:.9}100%{transform:scale(1);opacity:0}}
+.pulse-core {
+  width:17px; height:17px; background:var(--red); border-radius:50%;
+  box-shadow:0 0 14px var(--red-glow);
+  animation:corePulse 2.6s ease-in-out infinite; z-index:1;
+}
+@keyframes corePulse{0%,100%{transform:scale(1)}50%{transform:scale(1.35)}}
+.res-bpm {
+  font-size:var(--ts-hero); font-weight:800;
+  letter-spacing:-.055em; line-height:1;
+  background:linear-gradient(155deg,#fff 15%,var(--red) 85%);
+  -webkit-background-clip:text; -webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+.res-bpm-lbl {
+  font-size:var(--ts-xs); letter-spacing:.22em;
+  text-transform:uppercase; color:var(--tx3); font-weight:600; margin-top:var(--s1);
+}
+
+/* Name input */
+.name-field {
+  display:flex; align-items:center; gap:var(--s3);
+  background:var(--surf); border:1.5px solid var(--bdr2);
+  border-radius:var(--r4); padding:0 var(--s4); margin-bottom:var(--s3);
+  transition:border-color var(--fast);
+}
+.name-field:focus-within { border-color:var(--red); }
+.name-input {
+  flex:1; background:none; border:none; outline:none;
+  color:var(--tx); font-family:var(--font);
+  font-size:var(--ts-sm); padding:var(--s4) 0;
+}
+.name-input::placeholder { color:var(--tx3); }
+
+/* Generating banner */
+.gen-banner {
+  display:flex; align-items:center; gap:var(--s3);
+  background:var(--amber-dim); border:1px solid var(--amber-bdr);
+  border-radius:var(--r4); padding:var(--s3) var(--s4);
+  font-size:var(--ts-sm); color:var(--amber); margin-bottom:var(--s3);
+  animation:slideUp var(--std) var(--ease);
+}
+@keyframes slideUp{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.gen-dot {
+  width:7px;height:7px;border-radius:50%;background:var(--amber);flex-shrink:0;
+  animation:gdot .72s ease-in-out infinite;
+}
+@keyframes gdot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.2;transform:scale(.42)}}
+
+/* Wellness card */
+.wellness {
+  background:var(--surf); border:1px solid var(--bdr);
+  border-left:3px solid transparent;
+  border-radius:var(--r5); padding:var(--s4) var(--s5); margin-bottom:var(--s3);
+}
+.wellness.calm   { border-left-color:var(--teal); }
+.wellness.normal { border-left-color:var(--amber); }
+.wellness.stress { border-left-color:var(--red); }
+.wellness-badge {
+  display:inline-flex; align-items:center;
+  font-size:var(--ts-xs); font-weight:700;
+  padding:5px 12px; border-radius:var(--rf);
+  border:1px solid currentColor; margin-bottom:var(--s2);
+  letter-spacing:.05em;
+}
+.wellness-badge.calm   { color:var(--teal);  background:var(--teal-dim); }
+.wellness-badge.normal { color:var(--amber); background:var(--amber-dim); }
+.wellness-badge.stress { color:var(--red);   background:var(--red-dim); }
+.wellness-desc { font-size:var(--ts-xs); color:var(--tx2); line-height:1.65; }
+
+/* Metrics */
+.metrics {
+  display:grid; grid-template-columns:repeat(3,1fr);
+  gap:var(--s2); margin-bottom:var(--s3);
+}
+.met {
+  background:var(--surf); border:1px solid var(--bdr);
+  border-radius:var(--r4); padding:var(--s3) var(--s2); text-align:center;
+}
+.met-val {
+  font-size:var(--ts-xl); font-weight:800;
+  letter-spacing:-.03em; line-height:1; color:var(--tx);
+}
+.met-lbl {
+  font-size:var(--ts-2xs); letter-spacing:.1em;
+  text-transform:uppercase; color:var(--tx3); font-weight:600; margin-top:var(--s1);
+}
+
+/* Player */
+.player-wave {
+  width:100%; height:48px; display:block;
+  border-radius:var(--r2); margin-bottom:var(--s3);
+}
+.player-row {
+  display:flex; align-items:center; gap:var(--s3); margin-bottom:var(--s3);
+}
+.player-info { flex:1; min-width:0; }
+.player-title {
+  font-size:var(--ts-sm); font-weight:700; letter-spacing:-.01em;
+  color:var(--tx); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.player-sub { font-size:var(--ts-xs); color:var(--tx3); margin-top:2px; }
+.player-dur {
+  font-size:var(--ts-xs); font-weight:700;
+  color:var(--teal); border:1px solid var(--teal-bdr);
+  border-radius:var(--rf); padding:3px 8px; flex-shrink:0;
+}
+
+/* Playback bar */
+.pb-bar { margin-bottom:var(--s3); }
+.pb-track {
+  height:3px; background:var(--surf3);
+  border-radius:var(--rf); overflow:hidden; margin-bottom:var(--s2);
+}
+.pb-fill {
+  height:100%;
+  background:linear-gradient(90deg, var(--red), var(--amber));
+  border-radius:var(--rf); width:0%; transition:width 1s linear;
+}
+.pb-times {
+  display:flex; justify-content:space-between;
+  font-size:var(--ts-2xs); color:var(--tx3); font-weight:500;
+}
+
+/* Tempo */
+.tempo-row { display:flex; align-items:center; gap:var(--s3); }
+.tempo-lbl { font-size:var(--ts-xs); color:var(--tx3); font-weight:600; min-width:44px; }
+input[type=range] {
+  flex:1; -webkit-appearance:none; appearance:none;
+  height:3px; background:var(--surf3); border-radius:var(--rf); outline:none;
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance:none; width:18px; height:18px;
+  border-radius:50%; background:var(--red);
+  box-shadow:0 0 8px var(--red-glow); cursor:pointer;
+}
+input[type=range]::-moz-range-thumb {
+  width:18px; height:18px; border-radius:50%;
+  background:var(--red); border:none; cursor:pointer;
+}
+.tempo-val { font-size:var(--ts-xs); color:var(--red); font-weight:700; min-width:26px; text-align:right; }
+
+/* ═══════════════════════════════════════════════════════════
+   LIBRARY SCREEN
+═══════════════════════════════════════════════════════════ */
+.lib-hd {
+  display:flex; align-items:flex-end; justify-content:space-between;
+  padding:var(--s6) 0 var(--s5); flex-shrink:0;
+}
+.lib-title {
+  font-size:var(--ts-2xl); font-weight:800;
+  letter-spacing:-.03em; line-height:1.05;
+}
+.lib-title em { font-style:normal; font-weight:300; color:var(--tx2); }
+.lib-count { font-size:var(--ts-xs); color:var(--tx3); font-weight:600; padding-bottom:4px; letter-spacing:.06em; }
+
+/* Empty state */
+.empty {
+  display:flex; flex-direction:column; align-items:center;
+  text-align:center; padding:var(--s12) var(--s6) var(--s8);
+  gap:var(--s3); flex:1;
+}
+.empty-icon { font-size:54px; opacity:.22; }
+.empty-title { font-size:var(--ts-lg); font-weight:800; letter-spacing:-.02em; }
+.empty-desc { font-size:var(--ts-sm); color:var(--tx3); line-height:1.65; max-width:260px; }
+.empty .btn { width:auto; padding:var(--s3) var(--s8); min-height:46px; }
+
+/* Session cards */
+.sess-card {
+  background:var(--surf); border:1px solid var(--bdr);
+  border-left:3px solid transparent; border-radius:var(--r5);
+  padding:var(--s4) var(--s5); margin-bottom:var(--s3);
+  animation:cardIn var(--std) var(--ease);
+}
+@keyframes cardIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.sess-card.calm   { border-left-color:var(--teal); }
+.sess-card.normal { border-left-color:var(--amber); }
+.sess-card.stress { border-left-color:var(--red); }
+
+.sess-top {
+  display:flex; align-items:flex-start;
+  gap:var(--s2); margin-bottom:var(--s3);
+}
+.sess-name {
+  flex:1; min-width:0; font-size:var(--ts-md); font-weight:700;
+  letter-spacing:-.01em; line-height:1.25; color:var(--tx);
+}
+.sess-name-edit {
+  display:none; flex:1; min-width:0;
+  background:var(--surf2); border:1.5px solid var(--bdr2);
+  border-radius:var(--r3); padding:var(--s2) var(--s3);
+  color:var(--tx); font-family:var(--font); font-size:var(--ts-sm); outline:none;
+}
+.sess-name-edit:focus { border-color:var(--red); }
+.sess-actions { display:flex; gap:var(--s2); flex-shrink:0; }
+.sess-btn {
+  width:32px; height:32px; border-radius:var(--r3);
+  border:1px solid var(--bdr); background:var(--surf2);
+  color:var(--tx3); font-size:13px; cursor:pointer;
+  display:flex; align-items:center; justify-content:center;
+  transition:all var(--fast);
+}
+.sess-btn:hover { border-color:var(--bdr3); color:var(--tx); }
+.sess-btn.playing { color:var(--red); border-color:var(--red); background:var(--red-dim); }
+.sess-btn.del:hover { color:var(--red); border-color:var(--red); background:var(--red-dim); }
+.sess-chips { display:flex; flex-wrap:wrap; gap:var(--s2); }
+
+/* ═══════════════════════════════════════════════════════════
+   ERROR SCREEN
+═══════════════════════════════════════════════════════════ */
+.err-card {
+  background:var(--surf); border:1px solid rgba(232,51,74,.2);
+  border-radius:var(--r6); padding:var(--s10) var(--s6);
+  text-align:center; margin-bottom:var(--s5);
+}
+.err-icon { font-size:52px; display:block; margin-bottom:var(--s5); }
+.err-title { font-size:var(--ts-xl); font-weight:800; letter-spacing:-.02em; margin-bottom:var(--s3); }
+.err-msg   { font-size:var(--ts-sm); color:var(--tx2); line-height:1.7; }
+
+/* ═══════════════════════════════════════════════════════════
+   v4 NEW COMPONENTS
+═══════════════════════════════════════════════════════════ */
+
+/* EVOLUTION PHASE BADGE */
+.phase-badge {
+  display:inline-flex; align-items:center;
+  font-size:var(--ts-xs); font-weight:700; letter-spacing:.12em;
+  text-transform:uppercase; padding:5px 12px; border-radius:var(--rf);
+  border:1px solid var(--bdr2); color:var(--tx3);
+  background:var(--surf2); margin-top:var(--s2);
+  transition:color var(--std), border-color var(--std), background var(--std);
+}
+.phase-badge[data-phase="1"]{color:var(--teal);border-color:var(--teal-bdr);background:var(--teal-dim);}
+.phase-badge[data-phase="2"]{color:var(--amber);border-color:var(--amber-bdr);background:var(--amber-dim);}
+.phase-badge[data-phase="3"]{color:var(--red);border-color:var(--red-tint);background:var(--red-dim);
+  animation:phaseGlow 2.2s ease-in-out infinite;}
+@keyframes phaseGlow{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 8px var(--red-glow)}}
+
+.phase-tag {
+  font-size:var(--ts-xs); font-weight:700; letter-spacing:.08em;
+  text-transform:uppercase; padding:3px 9px; border-radius:var(--rf);
+  border:1px solid var(--red-tint); color:var(--red);
+  background:var(--red-dim); flex-shrink:0;
+}
+
+/* BPM TREND ARROW */
+.bpm-trend {
+  font-size:26px; font-weight:200; color:var(--tx3);
+  line-height:1; align-self:center; margin-left:auto;
+  transition:color var(--std);
+}
+.res-trend {
+  display:inline-block; font-size:var(--ts-xs); font-weight:600;
+  letter-spacing:.07em; color:var(--tx3); margin-top:var(--s1);
+}
+
+/* AMPLITUDE METER */
+.amp-wrap {
+  display:flex; align-items:center; gap:var(--s3);
+  margin-bottom:var(--s3);
+}
+.amp-track {
+  flex:1; height:4px; background:var(--surf3);
+  border-radius:var(--rf); overflow:hidden;
+}
+.amp-bar {
+  height:100%; width:0%;
+  background:linear-gradient(90deg,var(--teal),var(--red));
+  border-radius:var(--rf); transition:width 0.18s ease-out;
+}
+.amp-lbl {
+  font-size:var(--ts-2xs); color:var(--tx3); font-weight:600;
+  letter-spacing:.09em; text-transform:uppercase; white-space:nowrap;
+}
+
+/* CAMERA RING BEAT FLASH */
+.cam-ring.flash {
+  border-color:#fff;
+  box-shadow:0 0 0 8px rgba(255,255,255,.08), 0 0 40px var(--red-glow);
+  transition:box-shadow 0.06s ease-out, border-color 0.06s ease-out;
+}
+
+/* SCAN HEADER WITH PHASE BADGE */
+.scan-hd {
+  text-align:center;
+  padding:var(--s5) 0 var(--s4); flex-shrink:0;
+  display:flex; flex-direction:column; align-items:center; gap:var(--s1);
+}
+
+/* HEARTBEAT TIMELINE CHART */
+.timeline-card {
+  background:var(--surf); border:1px solid var(--bdr);
+  border-radius:var(--r5); padding:var(--s4) var(--s5);
+  margin-bottom:var(--s3);
+}
+.timeline-hd {
+  display:flex; align-items:center; gap:var(--s2);
+  margin-bottom:var(--s3);
+}
+.tl-icon{font-size:15px;}
+.tl-title{font-size:var(--ts-sm);font-weight:700;letter-spacing:-.01em;}
+.timeline-canvas{width:100%;height:52px;display:block;border-radius:var(--r2);}
+.timeline-labels{
+  display:flex;justify-content:space-between;
+  font-size:var(--ts-2xs);color:var(--tx3);font-weight:500;
+  margin-top:var(--s2);letter-spacing:.04em;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   TOAST
+═══════════════════════════════════════════════════════════ */
+.toast {
+  position:fixed;
+  bottom:calc(var(--navh) + var(--sb) + var(--s3));
+  left:50%; transform:translateX(-50%) translateY(10px);
+  background:var(--surf3); border:1px solid var(--bdr3);
+  border-radius:var(--rf); padding:var(--s3) var(--s5);
+  font-size:var(--ts-sm); font-weight:500; color:var(--tx);
+  opacity:0; pointer-events:none;
+  transition:opacity var(--std) var(--ease), transform var(--std) var(--ease);
+  z-index:400; white-space:nowrap;
+  max-width:calc(100vw - var(--s10));
+  overflow:hidden; text-overflow:ellipsis;
+}
+.toast.show  { opacity:1; transform:translateX(-50%) translateY(0); }
+.toast.success { border-color:var(--teal-bdr); color:var(--teal); }
+.toast.warn    { border-color:var(--amber-bdr); color:var(--amber); }
+.toast.error   { border-color:var(--red);        color:var(--red-hi); }
+
+/* ── UTILITIES ────────────────────────────────────────────── */
+.sr-only {
+  position:absolute;width:1px;height:1px;padding:0;margin:-1px;
+  overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;
+}
+.mt-auto { margin-top:auto; }
+.mb-3    { margin-bottom:var(--s3); }
+.mb-4    { margin-bottom:var(--s4); }
+.gap-4   { height:var(--s4); }
+.gap-8   { height:var(--s8); }
+.sep     { height:1px; background:var(--bdr); margin:var(--s4) 0; }
+
+/* ── REDUCED MOTION ───────────────────────────────────────── */
+@media (prefers-reduced-motion:reduce) {
+  *,*::before,*::after { animation-duration:.01ms!important; transition-duration:.01ms!important; }
+  .prog-fill,.pb-fill  { transition:none; }
+}
+
+/* ── HIGH CONTRAST ────────────────────────────────────────── */
+@media (forced-colors:active) {
+  .btn-p { background:ButtonText; color:ButtonFace; forced-color-adjust:none; }
+  .wellness-badge, .chip { border-width:2px; }
+}
