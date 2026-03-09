@@ -2032,346 +2032,241 @@ window.Storage = Storage;
 </script>
 <script>
 /* ================================================================
-   HeartBeat Studio — Audio Engine v11.0  "Megh Malhar"
-   ────────────────────────────────────────────────────────────────
-   Raga: Megh Malhar (Hindustani Classical, Malhar family)
-   Meaning: "Megh" = cloud. Said to invoke the monsoon.
-   Mood: Deep, serene, profound. The calm before the rain.
-   Time: Late night / monsoon season.
-   Thaat: Kafi
+   HeartBeat Studio — Audio Engine v12.0  MEGH MALHAR
+   Complete rewrite — fixes infinite buffering bug.
 
-   SWARAS (5 notes only — pentatonic):
-     Sa  = C4  = 256.00 Hz  (root, 432Hz system — Verdi tuning)
-     Re  = D4  = 287.35 Hz  (Shuddha Rishabh — Mukha swara)
-     Ma  = F4  = 341.72 Hz  (Shuddha Madhyam)
-     Pa  = G4  = 383.57 Hz  (Pancham — Samavadi)
-     ni  = Bb4 = 456.14 Hz  (Komal Nishad — gives monsoon quality)
-     Sa' = C5  = 512.00 Hz  (upper Sa)
+   BUG FIXES vs v11:
+   1. _mkReverb() was allocating 3.5s IR buffer on main thread
+      → on mobile this froze the page for 1-2+ seconds
+      → FIX: no convolution reverb. Simple delay-based "room" only.
+   2. _stage=0 was set AFTER seed init, then _stage=1 came later
+      but _stage=0 ran again inside start() resetting it
+      → FIX: _stage initialised to 1 at top of start(), never 0
+   3. _noteSec used stale _hrv variable instead of local hrv2
+      → FIX: use hrv2 everywhere
+   4. resume() could return a non-running context silently
+      → FIX: timeout guard, always return bool ok
 
-   AROHA  (ascending):  S  R  M  R  M  P  n  S'
-   AVAROHA (descending): S' n  P  M  R  M  n  R  S
-   PAKAD (identity phrase): R R S (n)S  M R  P M R (n)S
-   Vadi: Sa  |  Samavadi: Pa
-
-   KEY MUSICAL RULES implemented:
-   • Re is "mukha swara" — most important note, used frequently
-   • Re always approached by sliding from Ma: M→R (not direct leap)
-   • ni always approached by sliding from Pa: P→n
-   • Characteristic Malhar hook: S (m)R (m)R P
-   • Vakra (zigzag) movement in aroha: not straight up
-   • 5 authentic hand-composed phrases used as building blocks
-
-   SOUND DESIGN:
-   • Sa drone (tanpura-like) — continuous, very soft
-   • One melody note at a time — clean, no beating
-   • Slow tempo matching heartbeat feel (1 note per 2-4s)
-   • Sine wave with gentle frequency glide for meend (portamento)
-   • Light reverb to suggest open sky
-   • Unique seed per session (timestamp) = different each time
+   MEGH MALHAR RAGA (authentic):
+   Sa=256Hz Re=287Hz Ma=342Hz Pa=384Hz ni=456Hz (komal)
+   432Hz Verdi tuning. Meend glide on Re and ni.
 ================================================================ */
 'use strict';
 
 const AudioEngine = (() => {
 
-  /* ═══════════════════════════════════════════════════════════
-     MEGH MALHAR — Frequencies in C-root 432Hz system
-     Sa = C4 = 256 Hz  (Verdi pitch / 432Hz tuning)
-  ════════════════════════════════════════════════════════════ */
-  const HZ = {
-    Sn:  228.07,  /* lower Sa (C3 octave) — tanpura bass     */
-    Pn:  191.78,  /* lower Pa (G3) — tanpura 5th             */
-    S:   256.00,  /* Sa  C4 — root                           */
-    R:   287.35,  /* Re  D4 — mukha swara                    */
-    M:   341.72,  /* Ma  F4                                   */
-    P:   383.57,  /* Pa  G4 — samavadi                       */
-    n:   456.14,  /* ni  Bb4 — komal, monsoon quality        */
-    S2:  512.00,  /* Sa' C5 — upper octave                   */
-    R2:  574.70,  /* Re' D5                                   */
-    M2:  683.44,  /* Ma' F5                                   */
-    n2:  912.28,  /* ni' Bb5                                  */
-  };
+  /* Megh Malhar notes — 432Hz / Verdi tuning, Sa=C4=256Hz */
+  const S_  = 128.00;  /* Sa low  */
+  const P_  = 192.00;  /* Pa low  */
+  const S0  = 256.00;  /* Sa      */
+  const R0  = 287.35;  /* Re  ← mukha swara */
+  const M0  = 341.72;  /* Ma      */
+  const P0  = 383.57;  /* Pa      */
+  const N0  = 456.14;  /* ni komal */
+  const S1  = 512.00;  /* Sa'     */
+  const R1  = 574.70;  /* Re'     */
+  const M1  = 683.44;  /* Ma'     */
 
-  /* ═══════════════════════════════════════════════════════════
-     5 AUTHENTIC MEGH MALHAR PHRASES
-     Each is an array of [frequency, durationMultiplier]
-     durationMultiplier: 1=normal, 2=held, 0.5=quick passing note
-     These encode the actual raga grammar:
-       • Aroha uses vakra (zigzag) movement
-       • Re always comes via Ma
-       • ni always comes via Pa
-       • Phrases end with resolution to Sa or Re
-  ════════════════════════════════════════════════════════════ */
+  /* 5 authentic Megh Malhar phrases: [freq, durationMultiplier] */
+  /* Re always glides from Ma. ni always glides from Pa.         */
   const PHRASES = [
-    /* Phrase 1 — PAKAD (identity phrase) — most characteristic */
-    /* R R S (n)S  M R  P M R (n)S */
-    [
-      [HZ.R,  1.2], [HZ.R,  0.8],
-      [HZ.S,  1.5],
-      [HZ.n,  0.4], [HZ.S,  1.0],  /* (n) as grace note before S */
-      [HZ.M,  0.8], [HZ.R,  1.5],
-      [HZ.P,  0.8], [HZ.M,  0.6], [HZ.R,  2.0],
-    ],
-
-    /* Phrase 2 — AROHA movement: S R M R M P n S' */
-    [
-      [HZ.S,  1.0],
-      [HZ.R,  0.8], [HZ.M,  0.6], [HZ.R,  1.2],  /* Re via Ma */
-      [HZ.M,  0.8], [HZ.P,  1.2],
-      [HZ.n,  0.8], [HZ.S2, 2.5],  /* resolve to upper Sa */
-    ],
-
-    /* Phrase 3 — AVAROHA descent: S' n P M R M n R S */
-    [
-      [HZ.S2, 1.5],
-      [HZ.n,  0.8], [HZ.P,  1.0],  /* ni via Pa */
-      [HZ.M,  0.8], [HZ.R,  1.2],
-      [HZ.M,  0.6], [HZ.n,  0.5], [HZ.R,  1.5],
-      [HZ.S,  2.5],  /* resolve to Sa */
-    ],
-
-    /* Phrase 4 — MALHAR SIGNATURE: S (m)R (m)R P */
-    /* The defining Malhar hook — Re approached twice via Ma */
-    [
-      [HZ.S,  1.2],
-      [HZ.M,  0.3], [HZ.R,  1.0],  /* (m)R — Ma as grace into Re */
-      [HZ.M,  0.3], [HZ.R,  1.2],  /* (m)R again */
-      [HZ.P,  2.5],                  /* settle on Pa */
-      [HZ.M,  0.8], [HZ.R,  2.0],   /* descend to Re */
-    ],
-
-    /* Phrase 5 — MADHYA SAPTAK (mid-range meditation) */
-    /* M R  P n P  M R S */
-    [
-      [HZ.M,  0.8], [HZ.R,  1.0],
-      [HZ.P,  0.8], [HZ.n,  0.6], [HZ.P,  1.2],  /* n slides from P */
-      [HZ.M,  0.8], [HZ.R,  1.2],
-      [HZ.S,  2.5],
-    ],
+    /* Pakad — identity phrase: R R S (n)S M R P M R S */
+    [[R0,1.2],[R0,0.8],[S0,1.5],[N0,0.4],[S0,1.0],[M0,0.8],[R0,1.5],[P0,0.8],[M0,0.6],[R0,2.5]],
+    /* Aroha: S R M R M P n S' */
+    [[S0,1.0],[R0,0.8],[M0,0.6],[R0,1.2],[M0,0.8],[P0,1.2],[N0,0.8],[S1,2.5]],
+    /* Avaroha: S' n P M R M n R S */
+    [[S1,1.5],[N0,0.8],[P0,1.0],[M0,0.8],[R0,1.2],[M0,0.6],[N0,0.5],[R0,1.5],[S0,3.0]],
+    /* Malhar signature: S (m)R (m)R P M R */
+    [[S0,1.2],[M0,0.3],[R0,1.0],[M0,0.3],[R0,1.2],[P0,2.5],[M0,0.8],[R0,2.5]],
+    /* Mid: M R P n P M R S */
+    [[M0,0.8],[R0,1.0],[P0,0.8],[N0,0.6],[P0,1.2],[M0,0.8],[R0,1.2],[S0,3.0]],
   ];
 
-  /* Seeded PRNG */
-  function _mkRand(seed) {
-    let s=(seed>>>0)||0xDEAD1234;
+  const STAGE_NAMES=['Tanpura','Raga Emerging','Full Vistar','Deep Bhava'];
+  const MOODS=['Megh','Varsha','Neel','Gagana','Pavana','Saagar','Dharaa','Ambara','Tarang','Shanta','Nidra','Praana'];
+
+  let _ctx=null, _master=null, _volNode=null;
+  let _allNodes=[], _sched=null;
+  let _playing=false, _nextT=0;
+  let _stopCb=null, _beatCb=null;
+  let _melBus=null;
+  let _stage=1, _currentVolume=1.0, _unlocked=false;
+  let _rand=null, _sessionSeed=0;
+  let _noteSec=2.5, _bpm=72;
+  let _queue=[];
+
+  function _mkRand(seed){
+    let s=(seed>>>0)||0xDEAD5EED;
     return ()=>{s^=s<<13;s^=s>>>17;s^=s<<5;return(s>>>0)/0x100000000;};
   }
 
-  const STAGE_NAMES=['Tanpura Awakening','Raga Emerging','Full Vistar','Deep Bhava'];
-  const MOODS=['Megh','Varsha','Neel','Gagana','Pavana',
-               'Saagar','Dharaa','Ambara','Tarang','Shanta','Nidra','Praana'];
-
-  let _ctx=null,_master=null,_volNode=null;
-  let _reverb=null,_allNodes=[];
-  let _sched=null,_playing=false;
-  let _stopCb=null,_beatCb=null;
-  let _melBus=null;
-  let _stage=0,_currentVolume=1.0,_unlocked=false;
-  let _rand=null,_sessionSeed=0;
-  let _bpm=72,_noteSec=2.8;
-
-  /* Queue of upcoming [freq, dur] pairs from phrases */
-  let _queue=[], _nextT=0, _phraseCount=0;
-
-  /* ── AudioContext ── */
   function _ctxGet(){
     if(!_ctx||_ctx.state==='closed'){
       const AC=window.AudioContext||window.webkitAudioContext;
-      if(!AC)throw new Error('No Web Audio');
-      _ctx=new AC({latencyHint:'playback'});
+      if(!AC)throw new Error('No Web Audio API');
+      _ctx=new AC();
     }
     return _ctx;
   }
+
   function _unlock(c){
     if(_unlocked)return;
-    try{const b=c.createBuffer(1,1,c.sampleRate),s=c.createBufferSource();
-      s.buffer=b;s.connect(c.destination);s.start(0);s.stop(0.001);_unlocked=true;}catch{}
+    try{
+      const b=c.createBuffer(1,1,c.sampleRate),s=c.createBufferSource();
+      s.buffer=b;s.connect(c.destination);s.start(0);s.stop(0.001);
+      _unlocked=true;
+    }catch(e){}
   }
+
+  /* resume() — with hard 2s timeout so it never hangs forever */
   async function resume(){
-    const c=_ctxGet();_unlock(c);
-    if(c.state==='suspended'){
-      for(let i=0;i<4&&c.state==='suspended';i++){
-        try{await c.resume();}catch{}
-        if(c.state!=='running')await new Promise(r=>setTimeout(r,80));
-      }
+    try{
+      const c=_ctxGet();
+      _unlock(c);
+      if(c.state==='running') return c;
+      /* Try to resume with a 2 second timeout */
+      await Promise.race([
+        c.resume(),
+        new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),2000))
+      ]);
+      return c;
+    }catch(e){
+      /* If resume failed/timed out, create a fresh context */
+      try{ _ctx=null; const c=_ctxGet(); _unlock(c); return c; }catch(e2){ return null; }
     }
-    if(c.state==='closed'){_ctx=null;return _ctxGet();}
-    return c;
-  }
-  function _tr(...ns){_allNodes.push(...ns);return ns[0];}
-
-  /* ── Reverb — open-sky feel ── */
-  function _mkReverb(c){
-    const sr=c.sampleRate,len=Math.ceil(sr*3.5);
-    const ir=c.createBuffer(2,len,sr);
-    for(let ch=0;ch<2;ch++){
-      const d=ir.getChannelData(ch);
-      for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/len,2.2)*0.4;
-    }
-    const conv=c.createConvolver();conv.buffer=ir;return _tr(conv);
   }
 
-  /* ── TANPURA DRONE ───────────────────────────────────────────
-     The tanpura is the harmonic foundation of Indian classical.
-     Drones: Sa + Pa (5th) + upper Sa — all barely audible.
-     Very slow attack so it "appears" rather than starts.
-  ─────────────────────────────────────────────────────────── */
+  function _tr(...ns){ _allNodes.push(...ns); return ns[0]; }
+
+  /* Simple delay-based room effect — NO convolution, NO buffer allocation */
+  /* This is the key fix — _mkReverb() was freezing mobile for 1-2 seconds */
+  function _makeRoom(c){
+    const dly=c.createDelay(0.5);
+    dly.delayTime.value=0.22;
+    const fb=c.createGain(); fb.gain.value=0.28;
+    const wet=c.createGain(); wet.gain.value=0.30;
+    const lp=c.createBiquadFilter();
+    lp.type='lowpass'; lp.frequency.value=800;
+    dly.connect(lp); lp.connect(fb); fb.connect(dly);
+    dly.connect(wet);
+    _tr(dly,fb,wet,lp);
+    return {input:dly, output:wet};
+  }
+
+  /* Tanpura: Sa drone, very soft, direct to master */
   function _startTanpura(c){
-    const drones=[
-      [HZ.Sn*0.5, 0.055],   /* deep Sa sub */
-      [HZ.Sn,     0.048],   /* Sa bass      */
-      [HZ.Pn,     0.032],   /* Pa 5th       */
-      [HZ.S,      0.038],   /* Sa middle    */
-    ];
-    drones.forEach(([freq,amp],i)=>{
-      const osc=c.createOscillator(),g=c.createGain();
-      osc.type='sine'; osc.frequency.value=freq;
+    [[S_*0.5,0.040],[S_,0.035],[P_,0.022],[S0,0.028]].forEach(([f,a],i)=>{
+      const o=c.createOscillator(),g=c.createGain();
+      o.type='sine'; o.frequency.value=f;
       g.gain.setValueAtTime(0,c.currentTime);
-      g.gain.linearRampToValueAtTime(amp,c.currentTime+4+i*0.8);
-      osc.connect(g);
-      /* Tanpura goes through reverb for spaciousness */
-      if(_reverb){g.connect(_reverb);}else{g.connect(_master);}
-      osc.start();_tr(osc,g);
+      g.gain.linearRampToValueAtTime(a,c.currentTime+3+i*0.5);
+      o.connect(g); g.connect(_master);
+      o.start(); _tr(o,g);
     });
   }
 
-  /* ── MEEND (portamento glide) note ──────────────────────────
-     The soul of Hindustani music. Notes don't jump — they glide.
-     Re glides from Ma. ni glides from Pa.
-     Implementation: frequency ramps from 'fromFreq' to 'toFreq'
-     over the first 15% of the note duration.
-  ─────────────────────────────────────────────────────────── */
-  function _meendNote(c, t, freq, durSec, amp, fromFreq, dest){
-    const decay = Math.min(durSec, _noteSec * 0.88);
-    const glideTime = decay * 0.15; /* 15% of note = glide */
-
+  /* Single sine note with optional meend (portamento) glide */
+  function _note(c, t, freq, fromFreq, durSec, amp, dest){
+    const d=Math.max(0.3, Math.min(durSec, _noteSec*0.85));
     const env=c.createGain();
     env.gain.setValueAtTime(0,t);
-    env.gain.linearRampToValueAtTime(amp, t+0.012);     /* soft attack */
-    env.gain.exponentialRampToValueAtTime(amp*0.55, t+decay*0.3);
-    env.gain.exponentialRampToValueAtTime(0.0001, t+decay);
-    env.connect(dest);_tr(env);
+    env.gain.linearRampToValueAtTime(amp, t+0.012);
+    env.gain.exponentialRampToValueAtTime(amp*0.45, t+d*0.25);
+    env.gain.exponentialRampToValueAtTime(0.0001, t+d);
+    env.connect(dest); _tr(env);
 
-    const osc=c.createOscillator();
-    osc.type='sine';
-    /* Start from glide source frequency, ramp to target */
-    osc.frequency.setValueAtTime(fromFreq||freq, t);
-    if(fromFreq && fromFreq!==freq){
-      osc.frequency.linearRampToValueAtTime(freq, t+glideTime);
+    const o=c.createOscillator();
+    o.type='sine';
+    o.frequency.setValueAtTime(fromFreq, t);
+    if(fromFreq!==freq){
+      o.frequency.linearRampToValueAtTime(freq, t+d*0.12); /* meend */
     }
-    osc.connect(env);
-    osc.start(t);
-    osc.stop(t+decay+0.1);
-    _tr(osc);
+    o.connect(env);
+    o.start(t); o.stop(t+d+0.1);
+    _tr(o);
   }
 
-  /* Determine the "from" frequency for meend:
-     Re always slides from Ma. ni always slides from Pa.       */
-  function _fromFreq(freq){
-    if(Math.abs(freq-HZ.R)<1  || Math.abs(freq-HZ.R2)<1) return HZ.M;  /* M→R */
-    if(Math.abs(freq-HZ.n)<1  || Math.abs(freq-HZ.n2)<1) return HZ.P;  /* P→n */
-    return freq; /* all others: direct */
+  /* Meend source: Re comes from Ma, ni comes from Pa */
+  function _from(f){
+    if(Math.abs(f-R0)<1||Math.abs(f-R1)<1) return M0;
+    if(Math.abs(f-N0)<1) return P0;
+    return f;
   }
 
-  /* ── Heartbeat thud (very subtle — music is primary) ── */
+  /* Soft heartbeat thud */
   function _thud(c,t){
-    const amp=_bpm<65?0.06:_bpm>100?0.10:0.08;
-    const osc=c.createOscillator(),env=c.createGain();
-    osc.type='sine';
-    osc.frequency.setValueAtTime(44,t);
-    osc.frequency.exponentialRampToValueAtTime(22,t+0.22);
-    env.gain.setValueAtTime(0,t);
-    env.gain.linearRampToValueAtTime(amp,t+0.008);
-    env.gain.exponentialRampToValueAtTime(0.0001,t+0.30);
-    osc.connect(env);env.connect(_master);
-    osc.start(t);osc.stop(t+0.38);_tr(osc,env);
-    if(_beatCb&&_ctx)setTimeout(_beatCb,Math.max(0,(t-_ctx.currentTime)*1000));
+    const a=_bpm<65?0.06:_bpm>100?0.11:0.08;
+    const o=c.createOscillator(),e=c.createGain();
+    o.type='sine';
+    o.frequency.setValueAtTime(44,t);
+    o.frequency.exponentialRampToValueAtTime(22,t+0.20);
+    e.gain.setValueAtTime(0,t);
+    e.gain.linearRampToValueAtTime(a,t+0.008);
+    e.gain.exponentialRampToValueAtTime(0.0001,t+0.28);
+    o.connect(e); e.connect(_master);
+    o.start(t); o.stop(t+0.35); _tr(o,e);
+    if(_beatCb&&_ctx) setTimeout(_beatCb,Math.max(0,(t-_ctx.currentTime)*1000));
   }
 
-  /* ── Refill the phrase queue ── */
-  function _nextPhrase(){
-    /* Pick phrase — seed-driven so replay is identical */
-    /* Bias toward Pakad (phrase 0) and Aroha (phrase 1) */
-    const weights=[0.28, 0.22, 0.20, 0.18, 0.12];
-    const r=_rand();
-    let cumulative=0, idx=0;
+  function _fillQueue(){
+    const weights=[0.28,0.22,0.20,0.18,0.12];
+    const r=_rand(); let cum=0,idx=0;
     for(let i=0;i<weights.length;i++){
-      cumulative+=weights[i];
-      if(r<cumulative){idx=i;break;}
+      cum+=weights[i];
+      if(r<cum){idx=i;break;}
     }
-    /* Add a brief pause between phrases (silence = breathing room) */
-    _queue.push([0, 1.5]); /* silence marker */
+    _queue.push([0,1.2]); /* breath pause between phrases */
     _queue.push(...PHRASES[idx]);
-    _phraseCount++;
   }
 
-  /* ── Main scheduler ── */
   function _scheduler(c){
-    const LOOK_AHEAD=0.40;
-    while(_nextT < c.currentTime+LOOK_AHEAD){
+    const AHEAD=0.35;
+    while(_nextT < c.currentTime+AHEAD){
+      if(!_queue.length) _fillQueue();
+      const [freq,mul]=_queue.shift();
+      const dur=_noteSec*mul;
       const t=_nextT;
+      _nextT+=dur;
 
-      /* Refill queue when empty */
-      if(_queue.length===0) _nextPhrase();
+      if(freq===0) continue; /* silence — skip */
 
-      const [freq, durMul] = _queue.shift();
-      const noteDur = _noteSec * durMul;
-
-      if(freq===0){
-        /* Silence — just advance time */
-        _nextT += noteDur;
-        continue;
-      }
-
-      /* Heartbeat thud on every note (subtle) */
       _thud(c,t);
-
-      /* Melody note with meend glide */
-      if(_stage>=1 && _melBus){
-        const from=_fromFreq(freq);
-        _meendNote(c,t,freq,noteDur*0.9,0.24,from,_melBus);
-      }
-
-      _nextT+=noteDur;
+      if(_melBus) _note(c,t,freq,_from(freq),dur*0.88,0.26,_melBus);
     }
     _sched=setTimeout(()=>_scheduler(c),80);
   }
 
-  /* ════ PUBLIC — START ════ */
+  /* ══ PUBLIC: start ══ */
   async function start(bpm,hrv,seedOrTimeline,onStopFn){
     stop();
-    let c;try{c=await resume();}catch(e){console.error('[AE]',e);return false;}
-    if(!c||c.state!=='running'){console.warn('[AE] not running');return false;}
 
-    if(typeof seedOrTimeline==='function')_stopCb=seedOrTimeline;
-    else _stopCb=onStopFn||null;
-
-    _bpm=Math.max(40,Math.min(200,bpm||72));
-    const hrv2=Math.max(5,Math.min(100,hrv||45));
-
-    /* Unique seed: timestamp ensures every session is different */
-    if(typeof seedOrTimeline==='number'&&seedOrTimeline>0){
-      _sessionSeed=seedOrTimeline>>>0;
-    }else{
-      _sessionSeed=((_bpm*6271)+(hrv2*3919)+(Date.now()%999983))>>>0;
+    /* Resolve AudioContext — hard timeout prevents infinite hang */
+    const c=await resume();
+    if(!c||c.state!=='running'){
+      console.warn('[AE] AudioContext not running:',c?.state);
+      return false;
     }
+
+    _stopCb=(typeof seedOrTimeline==='function')?seedOrTimeline:(onStopFn||null);
+    _bpm=Math.max(40,Math.min(200,bpm||72));
+    const H=Math.max(5,Math.min(100,hrv||45));
+
+    /* Seed — number>0 means library replay (deterministic) */
+    _sessionSeed=(typeof seedOrTimeline==='number'&&seedOrTimeline>0)
+      ? (seedOrTimeline>>>0)
+      : ((_bpm*6271+H*3919+Date.now()%999983)>>>0);
     _rand=_mkRand(_sessionSeed);
 
-    /* Note duration from BPM:
-       Slower pulse → more spacious, meditative
-       Faster pulse → slightly quicker but still calm          */
-    _noteSec=Math.max(1.6,Math.min(4.0, 3.8-(_bpm-60)*0.018));
+    /* Note spacing: slow pulse = more space, fast pulse = tighter */
+    _noteSec=Math.max(1.8, Math.min(4.0, 3.8-(_bpm-60)*0.018 + (H-45)*0.005));
 
-    /* HRV adds subtle breathing variation to duration */
-    _noteSec+=(_hrv-45)*0.005;
-    _noteSec=Math.max(1.6,Math.min(4.2,_noteSec));
+    _queue=[]; _allNodes=[]; _stage=1; /* always start at 1 — music plays immediately */
 
-    _queue=[];_phraseCount=0;
-    _allNodes=[];_stage=0;
-
-    /* Signal chain */
+    /* Signal chain: melBus → room → master → vol → comp → out */
     const comp=c.createDynamicsCompressor();
-    comp.threshold.value=-18;comp.knee.value=12;
-    comp.ratio.value=2.5;comp.attack.value=0.015;comp.release.value=0.45;
-    comp.connect(c.destination);_tr(comp);
+    comp.threshold.value=-18; comp.knee.value=12;
+    comp.ratio.value=2.5; comp.attack.value=0.015; comp.release.value=0.40;
+    comp.connect(c.destination); _tr(comp);
 
     _volNode=c.createGain();
     _volNode.gain.setValueAtTime(_currentVolume,c.currentTime);
@@ -2379,50 +2274,46 @@ const AudioEngine = (() => {
 
     _master=c.createGain();
     _master.gain.setValueAtTime(0,c.currentTime);
-    _master.gain.linearRampToValueAtTime(0.82,c.currentTime+2.5);
+    _master.gain.linearRampToValueAtTime(0.80,c.currentTime+1.5);
     _master.connect(_volNode);
 
-    /* Reverb for tanpura + melody space */
-    _reverb=_mkReverb(c);
-    const rvg=c.createGain();rvg.gain.value=0.40;
-    _reverb.connect(rvg);rvg.connect(_master);_tr(rvg);
+    /* Room effect — pure delay network, zero buffer allocation */
+    const room=_makeRoom(c);
+    room.output.connect(_master);
 
-    /* Melody bus → gentle LP → direct + reverb */
-    /* gain=1 from the start — music plays immediately, no gate */
-    _melBus=c.createGain();_melBus.gain.value=1;_tr(_melBus);
+    /* Melody bus → room */
+    _melBus=c.createGain(); _melBus.gain.value=1; _tr(_melBus);
     const lp=c.createBiquadFilter();
-    lp.type='lowpass';lp.frequency.value=1400;lp.Q.value=0.4;
+    lp.type='lowpass'; lp.frequency.value=1400; lp.Q.value=0.4;
     _melBus.connect(lp);
-    lp.connect(_master);    /* direct — presence */
-    lp.connect(_reverb);    /* reverb — space    */
+    lp.connect(_master);       /* dry signal */
+    lp.connect(room.input);    /* wet signal */
     _tr(lp);
 
-    /* Start tanpura drone */
     _startTanpura(c);
 
-    _stage=1; /* start at stage 1 — melody plays from first note */
-    _nextT=c.currentTime+0.3; /* very short silence then music begins */
+    _nextT=c.currentTime+0.25; /* tiny gap then notes begin */
     _playing=true;
     _scheduler(c);
     return true;
   }
 
-  /* ════ PUBLIC — STOP ════ */
+  /* ══ PUBLIC: stop ══ */
   function stop(){
     if(_sched){clearTimeout(_sched);_sched=null;}
     _allNodes.forEach(n=>{try{n.stop?.();}catch{}try{n.disconnect();}catch{}});
     _allNodes=[];
     [_master,_volNode].forEach(n=>{if(n)try{n.disconnect();}catch{}});
-    _master=_volNode=_reverb=null;_melBus=null;
-    _queue=[];_playing=false;_stage=0;
+    _master=_volNode=_melBus=null;
+    _queue=[]; _playing=false; _stage=1;
     if(_stopCb){_stopCb();_stopCb=null;}
   }
 
-  function fadeOut(sec=3.0){
+  function fadeOut(sec=2.5){
     if(!_master||!_ctx){stop();return;}
     _master.gain.setValueAtTime(_master.gain.value,_ctx.currentTime);
     _master.gain.linearRampToValueAtTime(0.0001,_ctx.currentTime+sec);
-    setTimeout(stop,(sec+0.4)*1000);
+    setTimeout(stop,(sec+0.3)*1000);
   }
 
   function setVolume(v){
@@ -2431,27 +2322,21 @@ const AudioEngine = (() => {
     return _currentVolume;
   }
   function getVolume(){return _currentVolume;}
-
-  function setStage(n){
-    /* Stage is cosmetic only — never silences the melody bus.
-       Music plays from note 1. Stage just tracks UI badge state. */
-    _stage=Math.max(0,Math.min(3,n));
-  }
+  function setStage(n){ _stage=Math.max(1,Math.min(3,n)); } /* always ≥1 */
+  function getSessionSeed(){return _sessionSeed;}
+  function setBeatCallback(fn){_beatCb=typeof fn==='function'?fn:null;}
 
   function getMeta(bpm,hrv){
     const B=Math.max(40,Math.min(200,bpm||72));
     const H=Math.max(5,Math.min(100,hrv||45));
-    const moodIdx=Math.abs(Math.round(B*1.3+H*0.7))%MOODS.length;
-    const feel=H>55?'Gambhir (Profound)':H>28?'Shanta (Serene)':'Komal (Tender)';
+    const mi=Math.abs(Math.round(B*1.3+H*0.7))%MOODS.length;
+    const feel=H>55?'Gambhir':H>28?'Shanta':'Komal';
     return{
-      title:`${MOODS[moodIdx]} — Megh Malhar`,
+      title:`${MOODS[mi]} — Megh Malhar`,
       subtitle:`Raga Megh Malhar · 432Hz · ${feel}`,
-      instrument:'Raga Megh Malhar',style:'Hindustani Vilambit',
+      instrument:'Raga Megh Malhar', style:'Hindustani Vilambit',
     };
   }
-
-  function getSessionSeed(){return _sessionSeed;}
-  function setBeatCallback(fn){_beatCb=typeof fn==='function'?fn:null;}
 
   return{
     start,stop,fadeOut,resume,
@@ -2466,6 +2351,7 @@ const AudioEngine = (() => {
 
 window.AudioEngine=AudioEngine;
 </script>
+
 
 
 
