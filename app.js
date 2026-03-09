@@ -873,10 +873,10 @@ window.addEventListener('resize',()=>{
 
 /* ── INIT ──────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded',async()=>{
+  /* Unregister any old service workers that may be caching stale files */
   if('serviceWorker' in navigator){
-    navigator.serviceWorker.register('./service-worker.js')
-      .then(()=>console.log('[SW] registered'))
-      .catch(e=>console.warn('[SW]',e));
+    navigator.serviceWorker.getRegistrations()
+      .then(regs => regs.forEach(r => r.unregister()));
   }
   await Storage.init();
   await _updateBadge();
