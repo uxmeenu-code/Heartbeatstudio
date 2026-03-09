@@ -24,10 +24,37 @@ const S = {
   resultWavRaf:null, libPlayingId:null,
   evolutionTimer:null, evolutionStage:0,
   screen:'home',
+  musicPaused:false,  /* user explicitly paused — don't auto-restart */
 };
 
 /* ── SCREENS ───────────────────────────────────────────────── */
 function showScreen(name) {
+  const prev = S.screen;
+
+  /* ── Stop audio when navigating away ── */
+  if (prev !== name) {
+    /* Leaving results: stop result music completely */
+    if (prev === 'results' && AudioEngine.getIsPlaying()) {
+      AudioEngine.fadeOut(0.6);
+      _setPlayBtn(false);
+      stopPBTimer();
+      _stopEvolution();
+      AudioEngine.setBeatCallback(null);
+      /* Reset paused flag — next time results opens it's a fresh state */
+      S.musicPaused = false;
+    }
+    /* Leaving library: stop any library playback */
+    if (prev === 'library' && S.libPlayingId !== null) {
+      AudioEngine.stop();
+      AudioEngine.setBeatCallback(null);
+      S.libPlayingId = null;
+      /* Clear playing button state in DOM */
+      document.querySelectorAll('.sess-btn.playing').forEach(b => {
+        b.textContent = '▶'; b.classList.remove('playing');
+      });
+    }
+  }
+
   const MAP = {
     home:'scrHome', scan:'scrScan', results:'scrResults',
     library:'scrLibrary', profile:'scrProfile',
@@ -419,6 +446,9 @@ function _beginTimer() {
 function _finalize() {
   _stopCam();
 
+  /* Reset paused flag — new scan always starts fresh */
+  S.musicPaused = false;
+
   /* Increment free scan usage (subscribed users unaffected but call is safe) */
   Storage.incrementUsage();
 
@@ -443,7 +473,11 @@ function _finalize() {
 
   const banner=$id('genBanner'); if(banner)banner.hidden=false;
   startResultWave(bpm);
-  setTimeout(async()=>{ if(banner)banner.hidden=true; await _startMusic(bpm,hrv); },1300);
+  /* Resume AudioContext immediately — it was unlocked on user gesture (startScan).
+     We then start music right away; the generating spinner shows until audio begins. */
+  _startMusic(bpm,hrv).then(()=>{
+    if(banner)banner.hidden=true;
+  });
 }
 
 /* ── FILL RESULTS ──────────────────────────────────────────── */
@@ -463,12 +497,15 @@ function _fillResults() {
   if(wd)wd.textContent=d.desc;
   const meta=AudioEngine.getMeta(bpm,hrv);
   $set('mxTitle',meta.title); $set('mxSub',meta.subtitle);
+  /* Show zone instrument label in wellness area */
+  const zl=$id('zoneLabel'); if(zl)zl.textContent=meta.style;
   const sl=$id('tempoSlider'); if(sl)sl.value=bpm; $set('tempoVal',bpm);
   const dur=AudioEngine.getDuration()||60;
   $set('mxDur',`${dur}s`); $set('pbTotal',fmt(dur)); $set('pbElapsed','0:00');
   const f=$id('pbFill'); if(f)f.style.width='0%';
   _setPlayBtn(false);
   const sb=$id('stageBadge'); if(sb)sb.hidden=true;
+  const il=$id('instrLabel'); if(il)il.hidden=true; /* shown after music starts */
 
   /* Restore volume slider */
   const saved=Storage.getVolume();
@@ -478,32 +515,76 @@ function _fillResults() {
 
 /* ── START MUSIC ───────────────────────────────────────────── */
 async function _startMusic(bpm,hrv) {
+  /* If user explicitly paused, don't auto-restart */
+  if(S.musicPaused){ _setPlayBtn(false); return; }
+
+  /* Show spinner on play button — disabled until audio is ready */
+  _setPlayBtn('generating');
+
+  /* Always attempt to resume the AudioContext.
+     It was unlocked by the user gesture in startScan/toggleMusic,
+     but may have been suspended during the 30s scan. */
+  try { await AudioEngine.resume(); } catch {}
+
   /* Apply saved volume before starting */
   AudioEngine.setVolume(Storage.getVolume());
   const ok=await AudioEngine.start(bpm,hrv,S.heartbeatTimeline);
-  if(!ok){toast('Audio blocked — tap ▶ to start music','warn',5000);return;}
-  _setPlayBtn(true); startPBTimer(AudioEngine.getDuration());
-  AudioEngine.setBeatCallback(_onMusicBeat); _startEvolution();
+
+  if(!ok){
+    _setPlayBtn(false);
+    toast('Audio blocked — tap ▶ to start','warn',5000);
+    return;
+  }
+  _setPlayBtn(true);
+  startPBTimer(AudioEngine.getDuration());
+  AudioEngine.setBeatCallback(_onMusicBeat);
+  _startEvolution();
+  const il2=$id('instrLabel'); if(il2)il2.hidden=false;
 }
 
 /* ── TOGGLE MUSIC ──────────────────────────────────────────── */
 async function toggleMusic() {
   try { await AudioEngine.resume(); } catch {}
   if(AudioEngine.getIsPlaying()){
-    AudioEngine.fadeOut(); _setPlayBtn(false); stopPBTimer();
-    AudioEngine.setBeatCallback(null); _stopEvolution();
+    /* User hit pause — mark as explicitly paused and stop */
+    S.musicPaused = true;
+    AudioEngine.stop();           /* immediate stop — not fadeOut */
+    _setPlayBtn(false);
+    stopPBTimer();
+    AudioEngine.setBeatCallback(null);
+    _stopEvolution();
   } else {
+    /* User hit play — restart music */
+    S.musicPaused = false;
+    _setPlayBtn('generating');
     AudioEngine.setVolume(Storage.getVolume());
     const ok=await AudioEngine.start(S.musicBpm||S.bpm,S.hrv,S.heartbeatTimeline);
-    if(ok){ _setPlayBtn(true); startPBTimer(AudioEngine.getDuration()); AudioEngine.setBeatCallback(_onMusicBeat); _startEvolution(); }
-    else toast('Could not start audio — tap once more','warn');
+    if(ok){
+      _setPlayBtn(true);
+      startPBTimer(AudioEngine.getDuration());
+      AudioEngine.setBeatCallback(_onMusicBeat);
+      _startEvolution();
+    } else {
+      _setPlayBtn(false);
+      toast('Could not start audio — tap once more','warn');
+    }
   }
 }
-function _setPlayBtn(p) {
-  const b=$id('playBtn'); if(!b)return;
-  b.textContent=p?'⏸':'▶';
-  b.setAttribute('aria-label',p?'Pause music':'Play music');
-  b.classList.toggle('playing',p);
+function _setPlayBtn(state) {
+  const b=$id("playBtn"); if(!b)return;
+  if(state==="generating"){
+    b.textContent="";
+    b.setAttribute("aria-label","Generating musicu2026");
+    b.classList.remove("playing");
+    b.classList.add("generating");
+    b.disabled=true;
+  } else {
+    b.classList.remove("generating");
+    b.disabled=false;
+    b.textContent=state?"⏸":"▶";
+    b.setAttribute("aria-label",state?"Pause music":"Play music");
+    b.classList.toggle("playing",!!state);
+  }
 }
 
 /* ── TEMPO ─────────────────────────────────────────────────── */
@@ -544,10 +625,15 @@ async function renderLibrary() {
   if(!list)return;
   let sessions=[]; try{sessions=await Storage.loadSessions();}catch{}
   if(count)count.textContent=`${sessions.length} session${sessions.length!==1?'s':''}`;
-  if(sessions.length===0){
-    if(empty)empty.hidden=false; list.innerHTML=''; return;
+  /* Unambiguously control visibility — never rely solely on [hidden] */
+  const hasData = sessions.length > 0;
+  if(empty){
+    empty.hidden = hasData;
+    empty.style.display = hasData ? 'none' : 'flex';
+    empty.style.setProperty('display', hasData ? 'none' : 'flex', 'important');
   }
-  if(empty)empty.hidden=true;
+  list.style.display = hasData ? '' : 'none';
+  if(!hasData){ list.innerHTML=''; return; }
   list.innerHTML=sessions.map(s=>`
     <article class="sess-card ${s.mood}" role="listitem" aria-label="Session: ${esc(s.name)}">
       <div class="sess-top">
@@ -621,28 +707,74 @@ async function _updateBadge() {
   }catch{}
 }
 
-/* ── PROFILE ───────────────────────────────────────────────── */
-function selectGoal(goal) {
-  document.querySelectorAll('.goal-btn').forEach(btn=>
-    btn.setAttribute('aria-checked', btn.dataset.goal===goal?'true':'false'));
+/* ── PROFILE — view/edit mode ──────────────────────────────── */
+function enterProfileEdit() {
+  /* Populate edit fields from storage before showing */
+  const data = Storage.getProfile();
+  const ni=$id('profName');   if(ni) ni.value  = data.name   || '';
+  const ai=$id('profAge');    if(ai) ai.value   = data.age    || '';
+  const gi=$id('profGender'); if(gi) gi.value   = data.gender || '';
+  if(data.goal) selectGoal(data.goal);
+  /* Switch modes */
+  const vm=$id('profViewMode'), em=$id('profEditMode'), eb=$id('profEditBtn');
+  if(vm) vm.hidden=true;
+  if(em) em.hidden=false;
+  if(eb) eb.hidden=true;
+}
+function cancelProfileEdit() {
+  const vm=$id('profViewMode'), em=$id('profEditMode'), eb=$id('profEditBtn');
+  if(vm) vm.hidden=false;
+  if(em) em.hidden=true;
+  if(eb) eb.hidden=false;
 }
 function saveProfile() {
-  const name  = ($id('profName')?.value||'').trim();
-  const age   = ($id('profAge')?.value||'').trim();
-  const gender= $id('profGender')?.value||'';
-  const goal  = document.querySelector('.goal-btn[aria-checked="true"]')?.dataset.goal||'';
-  Storage.setProfile({name,age,gender,goal});
-  _refreshProfileUI(name); toast('Profile saved ✓','success');
+  const name   = ($id('profName')?.value  || '').trim();
+  const age    = ($id('profAge')?.value   || '').trim();
+  const gender = $id('profGender')?.value || '';
+  const goal   = document.querySelector('.goal-btn[aria-checked="true"]')?.dataset.goal || '';
+  Storage.setProfile({name, age, gender, goal});
+  /* Switch back to view mode first, then refresh */
+  cancelProfileEdit();
+  _refreshProfileUI();
+  toast('Profile saved ✓', 'success');
 }
-async function _refreshProfileUI(nameOverride) {
-  const data=Storage.getProfile();
-  const name=nameOverride!==undefined?nameOverride:(data.name||'');
-  const al=$id('profAvatarLetter'); if(al)al.textContent=name.trim()?name.trim()[0].toUpperCase():'?';
-  const ni=$id('profName'); if(ni)ni.value=data.name||'';
-  const ai=$id('profAge');  if(ai)ai.value=data.age||'';
-  const gi=$id('profGender');if(gi)gi.value=data.gender||'';
-  if(data.goal)selectGoal(data.goal);
+function selectGoal(goal) {
+  document.querySelectorAll('.goal-btn').forEach(btn =>
+    btn.setAttribute('aria-checked', btn.dataset.goal === goal ? 'true' : 'false'));
+}
+async function _refreshProfileUI() {
+  const data = Storage.getProfile();
+  const name = data.name || '';
 
+  /* Avatar letter */
+  const al=$id('profAvatarLetter');
+  if(al) al.textContent = name.trim() ? name.trim()[0].toUpperCase() : '?';
+
+  /* ── VIEW mode: populate info card ── */
+  const GOAL_LABELS = { relaxation:'🧘 Relaxation', fitness:'🏃 Fitness', stress:'🧠 Stress Monitoring', sleep:'🌙 Sleep Improvement' };
+  const GENDER_LABELS = { male:'Male', female:'Female', nonbinary:'Non-binary', other:'Other', '':'—' };
+  const hasAny = name || data.age || data.gender || data.goal;
+
+  const emptyDiv = $id('profInfoEmpty'), rowsDiv = $id('profInfoRows');
+  if(emptyDiv) emptyDiv.hidden = !!hasAny;
+  if(rowsDiv)  rowsDiv.hidden  = !hasAny;
+
+  if(hasAny) {
+    /* Name row */
+    const piName=$id('piName'), piNameVal=$id('piNameVal');
+    if(piName)   { piName.hidden = !name;    if(piNameVal) piNameVal.textContent = name || '—'; }
+    /* Age row */
+    const piAge=$id('piAge'), piAgeVal=$id('piAgeVal');
+    if(piAge)    { piAge.hidden = !data.age; if(piAgeVal) piAgeVal.textContent = data.age || '—'; }
+    /* Gender row */
+    const piGender=$id('piGender'), piGenderVal=$id('piGenderVal');
+    if(piGender) { piGender.hidden = !data.gender; if(piGenderVal) piGenderVal.textContent = GENDER_LABELS[data.gender]||'—'; }
+    /* Goal row */
+    const piGoal=$id('piGoal'), piGoalVal=$id('piGoalVal');
+    if(piGoal)   { piGoal.hidden = !data.goal; if(piGoalVal) piGoalVal.textContent = GOAL_LABELS[data.goal]||'—'; }
+  }
+
+  /* Stats */
   let sessions=[]; try{sessions=await Storage.loadSessions();}catch{}
   const count=sessions.length;
   const avgBpm=count?Math.round(sessions.reduce((s,x)=>s+(x.bpm||0),0)/count):null;
@@ -651,22 +783,21 @@ async function _refreshProfileUI(nameOverride) {
   const dates=new Set(sessions.map(s=>toDay(s.date+' '+(s.time||''))));
   let streak=0;
   for(let i=0;i<365;i++){const d=new Date(today);d.setDate(d.getDate()-i);if(dates.has(toDay(d)))streak++;else if(i>0)break;}
-
-  const ss=$id('profStatSessions');if(ss)ss.textContent=count;
-  const sb=$id('profStatAvgBpm');  if(sb)sb.textContent=avgBpm||'--';
-  const st=$id('profStatStreak');  if(st)st.textContent=streak;
+  const ss=$id('profStatSessions'); if(ss) ss.textContent=count;
+  const sb=$id('profStatAvgBpm');   if(sb) sb.textContent=avgBpm||'--';
+  const st=$id('profStatStreak');   if(st) st.textContent=streak;
 
   /* Subscription state */
   const sub=Storage.isSubscribed();
-  const pill=$id('subPill'),desc=$id('subDesc'),card=$id('subCard');
+  const pill=$id('subPill'), desc=$id('subDesc'), card=$id('subCard');
   if(sub){
     if(pill){pill.textContent='Premium';pill.className='sub-pill premium';}
-    if(desc)desc.textContent='You have unlimited access to all HeartBeat Studio features.';
+    if(desc) desc.textContent='You have unlimited access to all HeartBeat Studio features.';
     if(card){const btn=card.querySelector('.btn-upgrade');if(btn)btn.hidden=true;}
   } else {
     const{freeScansUsed}=Storage.getUsage();
     if(pill){pill.textContent='Free Plan';pill.className='sub-pill';}
-    if(desc)desc.textContent=`${freeScansUsed}/${Storage.FREE_LIMIT} free scans used. Upgrade for unlimited access.`;
+    if(desc) desc.textContent=`${freeScansUsed}/${Storage.FREE_LIMIT} free scans used. Upgrade for unlimited access.`;
   }
 }
 
@@ -725,6 +856,8 @@ document.addEventListener('DOMContentLoaded',async()=>{
   await _updateBadge();
   startHomeECG();
   _refreshUsageBar();
+  /* Pre-load library state so empty/sessions are correct before user visits */
+  renderLibrary();
 
   /* Restore volume */
   const savedVol=Storage.getVolume();
