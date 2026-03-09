@@ -2032,174 +2032,84 @@ window.Storage = Storage;
 </script>
 <script>
 /* ================================================================
-   HeartBeat Studio — Audio Engine v8.0
-   PULSE-DRIVEN MUSIC  (Formula-based biometric sonification)
+   HeartBeat Studio — Audio Engine v9.0  "Still Water"
    ────────────────────────────────────────────────────────────────
 
-   Implements the PDF formulas exactly:
+   The problem with v8: too many simultaneous sounds = sonic chaos.
 
-   1. TEMPO MAPPING
-      Tempo = α × HR + β
-      α = 0.8  (scaling factor — keeps music calmer than pulse)
-      β = -20  (base offset — anchors tempo in 50–65 BPM range)
-      → 72 BPM pulse  → music at 37.6 BPM  (very slow, meditative)
-      → 90 BPM pulse  → music at 52 BPM
-      → 110 BPM pulse → music at 68 BPM
-
-   2. PITCH MAPPING  (from pulse amplitude Pn)
-      Pn = (P − Pmin) / (Pmax − Pmin)   normalised 0→1
-      Pitch = Fmin + Pn × (Fmax − Fmin)
-      Fmin = 220 Hz (A3 in 432Hz tuning)
-      Fmax = 432 Hz (A4 — the sacred 432Hz root)
-      → Stronger pulse beats → brighter, higher notes
-      → Weaker pulse beats  → deeper, more grounded notes
-
-   3. VOLUME MAPPING  (from pulse amplitude)
-      Volume = Vmin + Pn × (Vmax − Vmin)
-      Vmin = 0.10, Vmax = 0.40
-      → Each beat-triggered note breathes with pulse intensity
-
-   4. HRV → HARMONY COMPLEXITY
-      HRV = sqrt(mean of squared IBI differences)
-      Low HRV  (< 25ms) → simple octave harmony, minimal notes
-      Mid HRV  (25–55ms)→ pentatonic 3rds, gentle movement
-      High HRV (> 55ms) → pentatonic 5ths + added colour tones
-
-   5. BEAT-TRIGGERED NOTES
-      Note(t) = 1 if heartbeat detected, else 0
-      Each heartbeat fires a melody note at the mapped pitch
-      Harmony note fires 0.18s after each beat (gentle echo)
-
-   6. 432 Hz ROOT TUNING
-      All notes derived from A = 432 Hz (not standard 440 Hz)
-      Pitch mapping endpoint: Fmax = 432 Hz
-
-   7. 528 Hz LOVE FREQUENCY DRONE
-      Always-on background sine at 528 Hz + 264 Hz sub
-      Volume: 0.022 (felt, not heard — psychoacoustic warmth)
-
-   SOUND DESIGN (no harsh content):
-   • Sine waves only — the softest waveform
-   • Sub-octave triangle adds warmth without brightness
-   • 800 Hz warm lowpass on all melodic voices
-   • 7-second convolution reverb
-   • Gentle delay at 3/4 of beat interval
-   • Slow LFO vibrato (0.05 Hz) for organic breathing feel
-   • No drums, no percussion, no noise
+   v9 design — radical simplicity:
+   • ONE melody note at a time. Never overlapping.
+   • ONE soft pad chord underneath. That's all.
+   • Bass only once every 4 bars. Very quiet.
+   • 432 Hz drone at volume 0.015 — almost inaudible warmth.
+   • 528 Hz at volume 0.012 — purely psychoacoustic.
+   • NO random amplitude jumps — all notes same gentle volume.
+   • Melody walks stepwise through C major pentatonic.
+     C D E G A — the happiest, most universally pleasant scale.
+   • Notes spaced FAR apart — 2–4 seconds of silence between.
+   • Piano-like envelope: fast attack, medium decay, silence.
+   • Reverb tail fills the silence with warmth.
+   • Formula mapping: HR → tempo, HRV → note spacing.
 ================================================================ */
 'use strict';
 
 const AudioEngine = (() => {
 
-  /* ════════════════════════════════════════════════════════════
-     FORMULA CONSTANTS  (from PDF)
-  ════════════════════════════════════════════════════════════ */
+  /* ── 432 Hz tuning: C4 = 256 Hz (Verdi tuning) ── */
+  /* C major pentatonic in 432Hz tuning, 2 octaves       */
+  /* C4=256, D4=287.4, E4=322.5, G4=384, A4=432          */
+  /* C5=512, D5=574.7, E5=645,   G5=768, A5=864          */
+  const SCALE = [
+    128.0,  /* C3  — very deep, bass only */
+    192.0,  /* G3  — bass                 */
+    256.0,  /* C4  — low melody           */
+    287.4,  /* D4                         */
+    322.5,  /* E4                         */
+    384.0,  /* G4                         */
+    432.0,  /* A4  — 432Hz root           */
+    512.0,  /* C5                         */
+    574.7,  /* D5                         */
+    645.0,  /* E5                         */
+    768.0,  /* G5  — high, bright         */
+  ];
 
-  /* Tempo mapping:  Tempo = α × HR + β */
-  const ALPHA = 0.8;   /* scaling factor */
-  const BETA  = -20;   /* base offset    */
+  /* Chord for pad: C + E + G (pure C major triad) */
+  const PAD_CHORD = [256.0, 322.5, 384.0];
 
-  /* Pitch mapping:  Pitch = Fmin + Pn × (Fmax − Fmin) */
-  const F_MIN = 220;   /* A3 in 432Hz tuning — deep, grounded */
-  const F_MAX = 432;   /* A4 = 432 Hz — the sacred root       */
-
-  /* Volume mapping: Vol = Vmin + Pn × (Vmax − Vmin) */
-  const V_MIN = 0.10;
-  const V_MAX = 0.38;
-
-  /* 432 Hz tuning base */
-  const A432 = 432;
-
-  /* ── Frequency from 432Hz tuning ── */
-  function _hz(semitones) {
-    return +(A432 * Math.pow(2, semitones / 12)).toFixed(4);
-  }
-
-  /* ── Pentatonic major scale, 3 octaves, rooted at given semitone ── */
-  function _buildScale(rootSemi) {
-    const PENT = [0, 2, 4, 7, 9]; /* do re mi sol la */
-    const notes = [];
-    for (let oct = -1; oct <= 2; oct++) {
-      PENT.forEach(s => {
-        const f = _hz(rootSemi + oct * 12 + s);
-        if (f >= 55 && f <= 1400) notes.push(f);
-      });
-    }
-    return notes.sort((a, b) => a - b);
-  }
-
-  /* ── Snap a raw Hz value to nearest scale note ── */
-  function _snapToScale(freq, scale) {
-    return scale.reduce((best, f) =>
-      Math.abs(f - freq) < Math.abs(best - freq) ? f : best
-    , scale[0]);
-  }
-
-  /* ── Seeded PRNG ── */
+  /* Seeded PRNG */
   function _mkRand(seed) {
-    let s = (seed >>> 0) || 0xC0FFEE42;
+    let s = (seed >>> 0) || 0xABCD1234;
     return () => { s ^= s<<13; s ^= s>>>17; s ^= s<<5; return (s>>>0)/0x100000000; };
   }
 
-  /* ── HRV-derived harmony interval (steps up the scale) ── */
-  function _harmInterval(hrv) {
-    if (hrv < 25) return 4;  /* octave-ish — simple, stable     */
-    if (hrv < 55) return 2;  /* pentatonic 3rd — warm, gentle   */
-    return 3;                 /* pentatonic 5th — open, spacious */
-  }
-
-  /* ── HRV-derived note density (notes per 16-step bar) ── */
-  function _noteDensity(hrv) {
-    if (hrv < 20) return 2;  /* very sparse — 2 melody notes    */
-    if (hrv < 40) return 3;  /* sparse — 3 melody notes         */
-    if (hrv < 60) return 4;  /* moderate — 4 melody notes       */
-    return 5;                 /* expressive — 5 melody notes     */
-  }
-
-  /* ── Build a 16-step melody grid from HRV density ── */
-  function _makeMelGrid(density, rand) {
-    const grid = new Array(16).fill(0);
-    /* Always hit beat 0 */
-    grid[0] = 1;
-    /* Spread remaining notes evenly with slight randomness */
-    const slots = [4, 6, 8, 10, 12].slice(0, density - 1);
-    slots.forEach(s => { grid[Math.min(15, s + Math.floor(rand() * 2))] = 1; });
-    return grid;
-  }
-
-  /* ── Build harmony grid: harmony fires 1 step after each melody note ── */
-  function _makeHarmGrid(melGrid) {
-    return melGrid.map((v, i) => melGrid[Math.max(0, i - 1)] ? 1 : 0);
-  }
-
-  /* ── Engine state ── */
+  /* Engine state */
   const STAGE_NAMES = ['Heartbeat Pulse','Melody Emerging','Harmony Awakened','Full Presence'];
   const TITLE_WORDS = ['Serenity','Stillness','Solace','Reverie','Drift',
-    'Resonance','Bloom','Aether','Clarity','Luminance','Tide','Presence'];
-  const CHROMATIC   = ['A','Bb','B','C','C#','D','Eb','E','F','F#','G','Ab'];
+    'Clarity','Bloom','Luminance','Presence','Resonance','Aether','Tide'];
+  const CHROMATIC   = ['C','C#','D','Eb','E','F','F#','G','Ab','A','Bb','B'];
 
-  let _ctx=null, _master=null, _volNode=null;
-  let _lfoOsc=null, _lfoGain=null;
-  let _reverb=null, _delay=null, _allNodes=[];
-  let _sched=null, _playing=false, _nextBar=0, _barN=0, _dur=60;
+  let _ctx=null, _master=null, _volNode=null, _comp=null;
+  let _reverb=null, _reverbGain=null, _allNodes=[];
+  let _sched=null, _playing=false, _nextNote=0, _noteCount=0;
   let _stopCb=null, _beatCb=null;
-  let _melBus=null, _harmBus=null, _padBus=null, _bassBus=null;
+  let _melBus=null, _padBus=null;
   let _stage=0;
   let _currentVolume=1.0, _unlocked=false;
   let _rand=null, _sessionSeed=0;
 
-  /* Per-session computed values (set in start()) */
-  let _scale=[], _melGrid=[], _harmGrid=[];
-  let _curHarmInterval=2, _musicBpm=40, _stepSec=1.5;
-  /* Melody walk position (stepwise — no leaps) */
-  let _melPos=0;
+  /* Per-session */
+  let _melPos=5;      /* start on G4 — middle of scale, pleasant */
+  let _noteSec=2.5;   /* seconds between melody notes            */
+  let _hrv=45;
+  let _bpm=72;
+  let _dur=90;
 
   /* ── AudioContext ── */
   function _ctxGet() {
     if (!_ctx || _ctx.state==='closed') {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) throw new Error('Web Audio not supported');
-      _ctx = new AC({ latencyHint:'playback', sampleRate:44100 });
+      _ctx = new AC({ latencyHint:'playback' });
     }
     return _ctx;
   }
@@ -2207,7 +2117,8 @@ const AudioEngine = (() => {
     if (_unlocked) return;
     try {
       const b=c.createBuffer(1,1,c.sampleRate), s=c.createBufferSource();
-      s.buffer=b; s.connect(c.destination); s.start(0); s.stop(0.001); _unlocked=true;
+      s.buffer=b; s.connect(c.destination); s.start(0); s.stop(0.001);
+      _unlocked=true;
     } catch {}
   }
   async function resume() {
@@ -2223,292 +2134,246 @@ const AudioEngine = (() => {
   }
   function _tr(...nodes) { _allNodes.push(...nodes); return nodes[0]; }
 
-  /* ── Long warm reverb (convolution) ── */
-  function _makeReverb(c, sec) {
-    const sr=c.sampleRate, len=Math.ceil(sr*sec);
-    const ir=c.createBuffer(2, len, sr);
+  /* ── Warm reverb ── */
+  function _makeReverb(c) {
+    const sr=c.sampleRate, len=Math.ceil(sr*5.5);
+    const ir=c.createBuffer(2,len,sr);
     for (let ch=0; ch<2; ch++) {
       const d=ir.getChannelData(ch);
       for (let i=0; i<len; i++) {
-        /* Smooth exponential tail, no harsh early reflections */
-        d[i] = (Math.random()*2-1) * Math.pow(1 - i/len, 2.2);
+        /* Smooth decay, no clicks */
+        d[i] = (Math.random()*2-1) * Math.pow(1-i/len, 1.8) * 0.5;
       }
     }
     const conv=c.createConvolver(); conv.buffer=ir; return _tr(conv);
   }
 
-  /* ── Warm lowpass filter ── */
-  function _warm(c, hz) {
+  /* ── Warm lowpass ── */
+  function _lp(c, hz) {
     const f=c.createBiquadFilter();
-    f.type='lowpass'; f.frequency.value=hz; f.Q.value=0.35;
+    f.type='lowpass'; f.frequency.value=hz; f.Q.value=0.5;
     return _tr(f);
   }
 
-  /* ── Soft sine note with smooth ADSR ──────────────────────────
-     Formula:  Volume = Vmin + Pn × (Vmax − Vmin)
-     The amp parameter is already the mapped volume.
-     Partials: fundamental sine + sub-octave sine + tiny 2nd harmonic
+  /* ── Piano-style note ──────────────────────────────────────────
+     Fast attack (0.008s) → decay to 40% → long tail → silence.
+     Uses ONLY pure sine waves.
+     ONE note plays at a time — no overlapping melody notes.
   ────────────────────────────────────────────────────────────── */
-  function _sineNote(c, t, freq, amp, atkSec, decSec, dest, lfoGn) {
-    const clampedAmp = Math.max(0.001, Math.min(0.8, amp));
+  function _pianoNote(c, t, freq, amp, dest) {
+    const totalDec = Math.min(3.8, _noteSec * 0.85); /* never longer than gap */
+
     const env = c.createGain();
     env.gain.setValueAtTime(0, t);
-    env.gain.linearRampToValueAtTime(clampedAmp, t + atkSec);
-    /* Sustain shoulder then long tail */
-    env.gain.setValueAtTime(clampedAmp, t + atkSec);
-    env.gain.exponentialRampToValueAtTime(clampedAmp * 0.45, t + atkSec + decSec * 0.4);
-    env.gain.exponentialRampToValueAtTime(0.0001, t + atkSec + decSec);
+    env.gain.linearRampToValueAtTime(amp, t + 0.008);       /* fast attack  */
+    env.gain.exponentialRampToValueAtTime(amp*0.38, t+0.18);/* piano decay  */
+    env.gain.exponentialRampToValueAtTime(0.0001, t+totalDec); /* tail      */
     env.connect(dest); _tr(env);
 
     /* Fundamental */
     const o1=c.createOscillator(), g1=c.createGain();
-    o1.type='sine'; o1.frequency.setValueAtTime(freq, t);
-    g1.gain.value=1.0; o1.connect(g1); g1.connect(env);
-    o1.start(t); o1.stop(t+atkSec+decSec+0.5); _tr(o1, g1);
-    if (lfoGn) try { lfoGn.connect(o1.frequency); } catch {}
+    o1.type='sine'; o1.frequency.value=freq;
+    g1.gain.value=1.0;
+    o1.connect(g1); g1.connect(env);
+    o1.start(t); o1.stop(t+totalDec+0.1); _tr(o1,g1);
 
-    /* Sub-octave (freq/2) — warmth, body */
+    /* Gentle 2nd harmonic — adds warmth like a real string */
     const o2=c.createOscillator(), g2=c.createGain();
-    o2.type='sine'; o2.frequency.setValueAtTime(freq*0.5, t);
-    g2.gain.value=0.32; o2.connect(g2); g2.connect(env);
-    o2.start(t); o2.stop(t+atkSec+decSec+0.5); _tr(o2, g2);
+    o2.type='sine'; o2.frequency.value=freq*2;
+    g2.gain.value=0.12;
+    o2.connect(g2); g2.connect(env);
+    o2.start(t); o2.stop(t+totalDec+0.1); _tr(o2,g2);
 
-    /* 2nd harmonic (freq×2) — very quiet presence */
+    /* Sub (freq/2) — body and presence */
     const o3=c.createOscillator(), g3=c.createGain();
-    o3.type='sine'; o3.frequency.setValueAtTime(freq*2, t);
-    g3.gain.value=0.07; o3.connect(g3); g3.connect(env);
-    o3.start(t); o3.stop(t+atkSec+decSec+0.5); _tr(o3, g3);
+    o3.type='sine'; o3.frequency.value=freq*0.5;
+    g3.gain.value=0.18;
+    o3.connect(g3); g3.connect(env);
+    o3.start(t); o3.stop(t+totalDec+0.1); _tr(o3,g3);
   }
 
-  /* ── 432 Hz grounding drone ── */
-  function _start432Drone(c) {
-    [[432, 0.038],[216, 0.048],[108, 0.022]].forEach(([freq, amp]) => {
-      const osc=c.createOscillator(), g=c.createGain();
-      osc.type='sine'; osc.frequency.value=freq;
-      g.gain.setValueAtTime(0, c.currentTime);
-      g.gain.linearRampToValueAtTime(amp, c.currentTime+4);
-      osc.connect(g); g.connect(_reverb||_master); osc.start(); _tr(osc, g);
-    });
+  /* ── Pad chord — long, slow, quiet ─────────────────────────────
+     Plays a soft C major chord underneath everything.
+     Long attack (1.5s) so it never "hits" — just materialises.
+  ────────────────────────────────────────────────────────────── */
+  function _padNote(c, t, freq, amp) {
+    const atk=1.5, dec=8.0;
+    const env=c.createGain();
+    env.gain.setValueAtTime(0,t);
+    env.gain.linearRampToValueAtTime(amp, t+atk);
+    env.gain.exponentialRampToValueAtTime(amp*0.5, t+atk+dec*0.5);
+    env.gain.exponentialRampToValueAtTime(0.0001, t+atk+dec);
+    env.connect(_padBus||_master); _tr(env);
+
+    const osc=c.createOscillator(), g=c.createGain();
+    osc.type='sine'; osc.frequency.value=freq;
+    g.gain.value=1.0;
+    osc.connect(g); g.connect(env);
+    osc.start(t); osc.stop(t+atk+dec+0.2); _tr(osc,g);
   }
 
-  /* ── 528 Hz love-frequency presence ── */
-  function _start528Drone(c) {
-    [[528, 0.022],[264, 0.028]].forEach(([freq, amp]) => {
-      const osc=c.createOscillator(), g=c.createGain();
-      osc.type='sine'; osc.frequency.value=freq;
-      g.gain.setValueAtTime(0, c.currentTime);
-      g.gain.linearRampToValueAtTime(amp, c.currentTime+6);
-      osc.connect(g); g.connect(_reverb||_master); osc.start(); _tr(osc, g);
-    });
+  /* ── 432 Hz grounding tone — barely audible ── */
+  function _startDrones(c) {
+    /* 432 Hz */
+    const o1=c.createOscillator(), g1=c.createGain();
+    o1.type='sine'; o1.frequency.value=432;
+    g1.gain.setValueAtTime(0,c.currentTime);
+    g1.gain.linearRampToValueAtTime(0.015, c.currentTime+5);
+    o1.connect(g1); g1.connect(_reverbGain||_master);
+    o1.start(); _tr(o1,g1);
+
+    /* 216 Hz sub */
+    const o2=c.createOscillator(), g2=c.createGain();
+    o2.type='sine'; o2.frequency.value=216;
+    g2.gain.setValueAtTime(0,c.currentTime);
+    g2.gain.linearRampToValueAtTime(0.018, c.currentTime+6);
+    o2.connect(g2); g2.connect(_reverbGain||_master);
+    o2.start(); _tr(o2,g2);
+
+    /* 528 Hz love frequency */
+    const o3=c.createOscillator(), g3=c.createGain();
+    o3.type='sine'; o3.frequency.value=528;
+    g3.gain.setValueAtTime(0,c.currentTime);
+    g3.gain.linearRampToValueAtTime(0.012, c.currentTime+7);
+    o3.connect(g3); g3.connect(_reverbGain||_master);
+    o3.start(); _tr(o3,g3);
   }
 
-  /* ── Ambient pad chord (root + 5th + octave, very slow) ── */
-  function _padChord(c, t, scale, amp) {
-    const rootIdx = Math.floor(scale.length/2);
-    const root  = scale[rootIdx];
-    const fifth = scale[Math.min(scale.length-1, rootIdx+3)] || root*1.498;
-    const oct   = root*2;
-    const padAtk=2.2, padDec=12.0;
-    [[root,1.0],[fifth,0.45],[oct,0.22]].forEach(([f, rel]) => {
-      _sineNote(c, t, f*0.5, amp*0.24*rel, padAtk, padDec, _padBus||_master, null);
-    });
-  }
-
-  /* ── Deep bass note ── */
-  function _bassNote(c, t, scale, amp) {
-    const bf = scale[1] * 0.25;
-    _sineNote(c, t, bf, amp*0.55, 0.08, 5.5, _bassBus||_master, null);
-  }
-
-  /* ── Heartbeat soft pulse ── */
-  function _heartbeatPulse(c, t, bpm) {
-    const amp = bpm < 65 ? 0.10 : bpm > 100 ? 0.16 : 0.13;
+  /* ── Heartbeat — one soft thud per beat ── */
+  function _heartbeatThud(c, t) {
+    const amp = _bpm < 65 ? 0.08 : _bpm > 100 ? 0.13 : 0.10;
     const osc=c.createOscillator(), env=c.createGain();
     osc.type='sine';
-    osc.frequency.setValueAtTime(55, t);
-    osc.frequency.exponentialRampToValueAtTime(28, t+0.22);
-    env.gain.setValueAtTime(0, t);
-    env.gain.linearRampToValueAtTime(amp, t+0.012);
-    env.gain.exponentialRampToValueAtTime(0.0001, t+0.35);
+    osc.frequency.setValueAtTime(52,t);
+    osc.frequency.exponentialRampToValueAtTime(26,t+0.20);
+    env.gain.setValueAtTime(0,t);
+    env.gain.linearRampToValueAtTime(amp,t+0.010);
+    env.gain.exponentialRampToValueAtTime(0.0001,t+0.30);
     osc.connect(env); env.connect(_master);
-    osc.start(t); osc.stop(t+0.42); _tr(osc, env);
-    if (_beatCb && _ctx) setTimeout(_beatCb, Math.max(0, (t-_ctx.currentTime)*1000));
+    osc.start(t); osc.stop(t+0.38); _tr(osc,env);
+    if (_beatCb&&_ctx) setTimeout(_beatCb, Math.max(0,(t-_ctx.currentTime)*1000));
   }
 
-  /* ════════════════════════════════════════════════════════════
-     BAR SCHEDULER
-     Implements beat-triggered notes (Formula 6: Note(t) = 1 if beat)
-     with pulse-amplitude pitch and volume mapping.
-  ════════════════════════════════════════════════════════════ */
-  function _schedBar(c, barStart, bpm, hrv) {
-    const nSteps = _melGrid.length;
-    const barDur = _stepSec * nSteps;
+  /* ── Melody step — ONE note, clean, musical ─────────────────── */
+  function _stepMelody(c, t) {
+    if (!_melBus) return;
 
-    /* Heartbeat pulse on bar downbeat */
-    _heartbeatPulse(c, barStart, bpm);
-
-    /* Pad chord — once per bar, very long */
-    if (_barN % 2 === 0 && _padBus) {
-      /* Pn for pad = low (grounded), amp breathes gently */
-      _padChord(c, barStart, _scale, 0.88);
+    /* Stepwise walk: ±1 step, gentle phrase arc over 8 notes */
+    const phrasePos = (_noteCount % 8) / 7;
+    const target    = Math.round(4 + Math.sin(phrasePos * Math.PI) * 3);
+    /* Move one step toward target */
+    if (_melPos < target) _melPos = Math.min(SCALE.length-1, _melPos+1);
+    else if (_melPos > target) _melPos = Math.max(0, _melPos-1);
+    /* Occasional small variation using seeded random */
+    if (_rand() < 0.25) {
+      const step = _rand() < 0.5 ? 1 : -1;
+      _melPos = Math.max(2, Math.min(SCALE.length-1, _melPos+step));
     }
 
-    /* Bass — once per bar */
-    if (_barN % 2 === 0 && _bassBus) {
-      _bassNote(c, barStart, _scale, 0.72);
-    }
-
-    for (let s=0; s < nSteps; s++) {
-      const t = barStart + s * _stepSec;
-
-      /* ── MELODY NOTE ──
-         Formula 2: Pitch = Fmin + Pn × (Fmax − Fmin)
-         Pn is derived from HRV (higher HRV = more expressive range)
-         Then snapped to nearest pentatonic scale note.
-
-         Formula 8: Volume = Vmin + Pn × (Vmax − Vmin)
-         Pn varies per step, simulating pulse amplitude variation. */
-      if (_melGrid[s] && _melBus) {
-        /* Simulate Pn per step — seeded so identical on replay */
-        const Pn = 0.3 + _rand() * 0.7;  /* 0.3–1.0 */
-
-        /* Pitch mapping from formula — then snap to scale */
-        const rawPitch = F_MIN + Pn * (F_MAX - F_MIN);
-        /* Walk melody position toward the mapped pitch */
-        const targetNote = _snapToScale(rawPitch, _scale);
-        const targetIdx  = _scale.indexOf(targetNote);
-        /* Stepwise: move ±1 toward target, never leap */
-        if (targetIdx > _melPos && _melPos < _scale.length-1) _melPos++;
-        else if (targetIdx < _melPos && _melPos > 0) _melPos--;
-        const melFreq = _scale[_melPos];
-
-        /* Volume from formula */
-        const vol = V_MIN + Pn * (V_MAX - V_MIN);
-
-        /* Note duration: longer for slower pulse, shorter for faster */
-        const atkSec = 0.10 + (1 - Pn) * 0.25;
-        const decSec = 4.5  + (1 - Pn) * 4.0;  /* 4.5–8.5 seconds */
-
-        _sineNote(c, t, melFreq, vol, atkSec, decSec, _melBus, _lfoGain);
-
-        /* ── HARMONY NOTE ──
-           HRV controls harmony interval (Formula 7: HRV → complexity)
-           Fires slightly after melody — like a gentle echo */
-        if (_harmGrid[s] && _harmBus) {
-          const hIdx = Math.min(_scale.length-1, _melPos + _curHarmInterval);
-          const hFreq = _scale[hIdx];
-          const harmVol = vol * 0.55;
-          _sineNote(c, t+0.18, hFreq, harmVol, atkSec+0.08, decSec+1.5, _harmBus, null);
-        }
-      }
-    }
+    const freq = SCALE[_melPos];
+    const amp  = 0.28; /* fixed, consistent volume — no random jumps */
+    _pianoNote(c, t, freq, amp, _melBus);
+    _noteCount++;
   }
 
-  function _scheduler(c, bpm, hrv) {
-    const barDur = _stepSec * _melGrid.length;
-    while (_nextBar < c.currentTime + 0.45) {
-      _schedBar(c, _nextBar, bpm, hrv);
-      _nextBar += barDur; _barN++;
+  /* ── Pad refresh every 8 notes ── */
+  function _refreshPad(c, t) {
+    if (!_padBus) return;
+    PAD_CHORD.forEach(f => _padNote(c, t, f*0.5, 0.055));
+  }
+
+  /* ── Main scheduler ── */
+  function _scheduler(c) {
+    const lookAhead = 0.40;
+    while (_nextNote < c.currentTime + lookAhead) {
+      const t = _nextNote;
+
+      /* Heartbeat thud on every note */
+      _heartbeatThud(c, t);
+
+      /* Melody note */
+      if (_stage >= 1) _stepMelody(c, t);
+
+      /* Pad refresh every 8 notes */
+      if (_stage >= 0 && _noteCount % 8 === 0) _refreshPad(c, t);
+
+      _nextNote += _noteSec;
     }
-    _sched = setTimeout(() => _scheduler(c, bpm, hrv), 100);
+    _sched = setTimeout(() => _scheduler(c), 80);
   }
 
   /* ════ PUBLIC — START ════ */
   async function start(bpm, hrv, timelineOrSeed, onStopFn) {
     stop();
     let c; try { c=await resume(); } catch(e) { console.error('[AE]',e); return false; }
-    if (!c || c.state!=='running') { console.warn('[AE] not running'); return false; }
+    if (!c||c.state!=='running') { console.warn('[AE] not running'); return false; }
 
     if (typeof timelineOrSeed==='function') _stopCb=timelineOrSeed;
     else _stopCb=onStopFn||null;
 
-    const B = Math.max(40, Math.min(200, bpm||72));
-    const H = Math.max(5,  Math.min(100, hrv||45));
+    _bpm  = Math.max(40, Math.min(200, bpm||72));
+    _hrv  = Math.max(5,  Math.min(100, hrv||45));
 
     /* Seed */
     _sessionSeed = (typeof timelineOrSeed==='number' && timelineOrSeed>0)
       ? (timelineOrSeed>>>0)
-      : (((B*7919 + H*6271) ^ (Date.now()/1000|0)) >>> 0);
+      : (((_bpm*7919 + _hrv*6271) ^ (Date.now()/1000|0)) >>> 0);
     _rand = _mkRand(_sessionSeed);
 
-    /* ── Formula 3: Tempo = α × HR + β ──
-       α=0.8, β=-20. Clamp to 16–72 BPM for always-calm music.     */
-    _musicBpm = Math.max(16, Math.min(72, Math.round(ALPHA * B + BETA)));
-    _stepSec  = 60 / _musicBpm;
+    /* Formula: Tempo = 0.8 × HR − 20, clamped 16–60
+       Note spacing = 60 / musicBpm seconds               */
+    const musicBpm = Math.max(16, Math.min(60, Math.round(0.8*_bpm - 20)));
+    _noteSec = 60 / musicBpm;
 
-    /* ── Formula 7: HRV → harmony + density ── */
-    _curHarmInterval = _harmInterval(H);
-    const density = _noteDensity(H);
-    _melGrid  = _makeMelGrid(density, _rand);
-    _harmGrid = _makeHarmGrid(_melGrid);
+    /* HRV slightly varies note spacing — higher HRV = more breathing room */
+    _noteSec += (_hrv - 45) * 0.008;
+    _noteSec  = Math.max(1.5, Math.min(4.5, _noteSec));
 
-    /* Scale — root tracks HR zone for variety */
-    const rootSemi = B<65 ? -7 : B<=80 ? 0 : B<=95 ? 3 : B<=110 ? -5 : -3;
-    _scale  = _buildScale(rootSemi);
-    _melPos = Math.floor(_scale.length / 2); /* start in middle */
+    _dur       = 90;
+    _allNodes  = []; _noteCount=0; _stage=0;
+    _melPos    = 5; /* start on G4 */
 
-    const nSteps  = _melGrid.length;
-    const barDur  = _stepSec * nSteps;
-    const totalBars = Math.ceil(90 / barDur) + 8;
-    _dur = Math.ceil(totalBars * barDur);
-    _allNodes=[]; _barN=0; _stage=0;
-
-    /* ── Signal chain ──
-       sources → buses → warmth filter → reverb + delay → master → vol → comp → out */
-    const comp = c.createDynamicsCompressor();
-    comp.threshold.value=-20; comp.knee.value=12;
-    comp.ratio.value=3; comp.attack.value=0.010; comp.release.value=0.30;
-    comp.connect(c.destination); _tr(comp);
+    /* Signal chain: buses → filter → reverb → master → vol → comp → out */
+    _comp = c.createDynamicsCompressor();
+    _comp.threshold.value=-16; _comp.knee.value=10;
+    _comp.ratio.value=3; _comp.attack.value=0.010; _comp.release.value=0.30;
+    _comp.connect(c.destination); _tr(_comp);
 
     _volNode = c.createGain();
     _volNode.gain.setValueAtTime(_currentVolume, c.currentTime);
-    _volNode.connect(comp);
+    _volNode.connect(_comp);
 
     _master = c.createGain();
     _master.gain.setValueAtTime(0, c.currentTime);
-    _master.gain.linearRampToValueAtTime(0.82, c.currentTime+3.5); /* gentle swell */
+    _master.gain.linearRampToValueAtTime(0.80, c.currentTime+3.0);
     _master.connect(_volNode);
 
-    /* Long warm reverb (7s) */
-    const rvWet = c.createGain(); rvWet.gain.value = 0.65;
-    _reverb = _makeReverb(c, 7.0);
-    _reverb.connect(rvWet); rvWet.connect(_master); _tr(rvWet);
+    /* Reverb — everything goes through it */
+    _reverb    = _makeReverb(c);
+    _reverbGain = c.createGain(); _reverbGain.gain.value=0.55;
+    _reverb.connect(_reverbGain); _reverbGain.connect(_master); _tr(_reverbGain);
 
-    /* Delay at 3/4 of beat — classic meditation music spacing */
-    const dly=c.createDelay(4.0), dfb=c.createGain(), dwt=c.createGain();
-    dly.delayTime.setValueAtTime(_stepSec*0.75, c.currentTime);
-    dfb.gain.value=0.24; dwt.gain.value=0.16;
-    dly.connect(dfb); dfb.connect(dly); dly.connect(dwt); dwt.connect(_master);
-    _delay=dly; _tr(dly,dfb,dwt);
+    /* Melody bus → warm LP → reverb + direct */
+    _melBus = c.createGain(); _melBus.gain.value=0; _tr(_melBus);
+    const melLP = _lp(c, 1200);
+    _melBus.connect(melLP);
+    melLP.connect(_reverb);
+    melLP.connect(_master); /* also direct for presence */
 
-    /* LFO — very slow vibrato (0.05 Hz = one full breath cycle) */
-    const lfoOsc=c.createOscillator(), lfoGn=c.createGain();
-    lfoOsc.type='sine'; lfoOsc.frequency.value=0.05;
-    lfoGn.gain.value = 2.2 + H * 0.04; /* wider vibrato with higher HRV */
-    lfoOsc.connect(lfoGn); lfoOsc.start();
-    _lfoGain=lfoGn; _lfoOsc=lfoOsc; _tr(lfoOsc,lfoGn);
+    /* Pad bus → very warm LP → reverb */
+    _padBus = c.createGain(); _padBus.gain.value=1; _tr(_padBus);
+    const padLP = _lp(c, 600);
+    _padBus.connect(padLP); padLP.connect(_reverb);
 
-    /* Layer buses — warmth filtered, start silent */
-    _padBus  = c.createGain(); _padBus.gain.value  = 0;
-    _melBus  = c.createGain(); _melBus.gain.value  = 0;
-    _harmBus = c.createGain(); _harmBus.gain.value = 0;
-    _bassBus = c.createGain(); _bassBus.gain.value = 0;
-    _tr(_padBus, _melBus, _harmBus, _bassBus);
+    /* Drones */
+    _startDrones(c);
 
-    /* Warm lowpass on each layer — removes any harsh highs */
-    const pw=_warm(c,700),  mw=_warm(c,900),
-          hw=_warm(c,800),  bw=_warm(c,500);
-    _padBus.connect(pw);  pw.connect(_reverb);
-    _melBus.connect(mw);  mw.connect(_delay);
-    _harmBus.connect(hw); hw.connect(_reverb);
-    _bassBus.connect(bw); bw.connect(_master);
+    /* Initial pad */
+    _refreshPad(c, c.currentTime + 0.5);
 
-    /* Start sacred frequency drones */
-    _start432Drone(c);
-    _start528Drone(c);
-
-    _nextBar=c.currentTime+0.18; _playing=true;
-    _scheduler(c, B, H);
+    _nextNote = c.currentTime + 1.0; /* 1s silence before first note */
+    _playing  = true;
+    _scheduler(c);
     return true;
   }
 
@@ -2518,9 +2383,8 @@ const AudioEngine = (() => {
     _allNodes.forEach(n=>{try{n.stop?.();}catch{}try{n.disconnect();}catch{}});
     _allNodes=[];
     [_master,_volNode].forEach(n=>{if(n)try{n.disconnect();}catch{}});
-    _master=_volNode=null;
-    _reverb=_delay=_lfoGain=_lfoOsc=null;
-    _melBus=_harmBus=_padBus=_bassBus=null;
+    _master=_volNode=_comp=_reverb=_reverbGain=null;
+    _melBus=_padBus=null;
     _playing=false; _stage=0;
     if (_stopCb){_stopCb();_stopCb=null;}
   }
@@ -2539,32 +2403,27 @@ const AudioEngine = (() => {
   }
   function getVolume(){return _currentVolume;}
 
-  /* setStage — gradual layer reveal */
   function setStage(n) {
-    if (!_playing||!_ctx) return;
-    const now=_ctx.currentTime, ramp=5.5;
+    if (!_ctx) return;
     _stage=Math.max(0,Math.min(3,n));
-    const T={pad:1, mel:_stage>=1?1:0, harm:_stage>=2?1:0, bass:_stage>=1?1:0};
-    const fade=(g,v)=>{g.setValueAtTime(g.value,now);g.linearRampToValueAtTime(v,now+ramp);};
-    if(_padBus)  fade(_padBus.gain,  T.pad);
-    if(_melBus)  fade(_melBus.gain,  T.mel);
-    if(_harmBus) fade(_harmBus.gain, T.harm);
-    if(_bassBus) fade(_bassBus.gain, T.bass);
+    /* Melody fades in at stage 1 */
+    if (_melBus&&_ctx) {
+      const now=_ctx.currentTime;
+      _melBus.gain.setValueAtTime(_melBus.gain.value,now);
+      _melBus.gain.linearRampToValueAtTime(_stage>=1?1:0, now+4.0);
+    }
   }
 
   function getMeta(bpm, hrv) {
     const B=Math.max(40,Math.min(200,bpm||72));
     const H=Math.max(5, Math.min(100,hrv||45));
-    const musicBpm=Math.max(16,Math.min(72,Math.round(ALPHA*B+BETA)));
+    const mBpm=Math.max(16,Math.min(60,Math.round(0.8*B-20)));
     const ti=Math.abs(Math.round(B*1.4+H*0.6))%TITLE_WORDS.length;
-    const key=CHROMATIC[Math.round(B/5.8)%12];
-    const hv=H>52?'Expressive':H>28?'Flowing':'Intimate';
-    const density=_noteDensity(H);
-    const densityLbl=['','Sparse','Sparse','Balanced','Flowing','Expressive'][density]||'Balanced';
+    const hv=H>55?'Expressive':H>28?'Flowing':'Intimate';
     return {
-      title:`${TITLE_WORDS[ti]} in ${key}`,
-      subtitle:`432Hz · ${musicBpm} BPM · ${densityLbl} Melody · ${hv} HRV`,
-      instrument:`Sine Pads & Strings`, style:hv,
+      title:`${TITLE_WORDS[ti]} in C`,
+      subtitle:`432Hz Pentatonic · ${mBpm} BPM · ${hv}`,
+      instrument:'Piano & Pads', style:'Still Water',
     };
   }
 
@@ -2584,6 +2443,7 @@ const AudioEngine = (() => {
 
 window.AudioEngine=AudioEngine;
 </script>
+
 
 
 <script>
