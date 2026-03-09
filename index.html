@@ -155,6 +155,12 @@
     <div class="gen-dot"></div> 🎵 Generating your heartbeat music…
   </div>
 
+  <!-- Instrument zone label -->
+  <div class="instr-label" id="instrLabel" hidden>
+    <span class="instr-icon">🎼</span>
+    <span id="zoneLabel">Piano &amp; Cello</span>
+  </div>
+
   <div class="stage-badge" id="stageBadge" hidden role="status" aria-live="polite">
     <span class="stage-dot"></span><span id="stageTxt">Heartbeat Pulse</span>
   </div>
@@ -239,10 +245,15 @@
 
 <!-- ══ PROFILE ════════════════════════════════════════════════ -->
 <section class="screen" id="scrProfile" role="region" aria-label="Profile">
-  <div class="prof-hd">
+  <div class="prof-hd-row">
     <h2 class="lib-title">My<br><em>Profile</em></h2>
+    <!-- Edit button shown in VIEW mode -->
+    <button class="prof-edit-btn" id="profEditBtn" onclick="enterProfileEdit()" aria-label="Edit profile">
+      ✏️ Edit
+    </button>
   </div>
 
+  <!-- Avatar + Stats (always visible) -->
   <div class="prof-hero">
     <div class="prof-avatar">
       <span class="prof-avatar-letter" id="profAvatarLetter">?</span>
@@ -265,66 +276,101 @@
     </div>
   </div>
 
-  <!-- Subscription card -->
-  <div class="sub-card" id="subCard" role="region" aria-label="Subscription">
-    <div class="sub-card-left">
-      <span class="sub-pill" id="subPill">Free Plan</span>
-      <p class="sub-desc" id="subDesc">Upgrade to unlock unlimited sessions, advanced HRV insights &amp; exclusive soundscapes.</p>
-    </div>
-    <button class="btn-upgrade" onclick="upgradeSubscription()">Upgrade</button>
-  </div>
-
-  <!-- Personal Info -->
-  <div class="prof-section">
-    <h3 class="prof-section-title">Personal Info</h3>
-    <div class="prof-field">
-      <label class="prof-label" for="profName">Display Name</label>
-      <input type="text" id="profName" class="prof-input" placeholder="Your name" maxlength="40" autocomplete="name">
-    </div>
-    <div class="prof-field-row">
-      <div class="prof-field prof-field-half">
-        <label class="prof-label" for="profAge">Age <span class="prof-opt">(optional)</span></label>
-        <input type="number" id="profAge" class="prof-input" placeholder="e.g. 32" min="13" max="120">
+  <!-- ── VIEW MODE ─────────────────────────────────────── -->
+  <div id="profViewMode">
+    <!-- Saved info display card -->
+    <div class="prof-info-card" id="profInfoCard">
+      <div class="prof-info-empty" id="profInfoEmpty">
+        <span class="prof-info-empty-icon">👤</span>
+        <p>No profile set up yet.</p>
+        <button class="btn btn-s" style="width:auto;min-height:40px;padding:8px 24px;font-size:12px" onclick="enterProfileEdit()">Create Profile</button>
       </div>
-      <div class="prof-field prof-field-half">
-        <label class="prof-label" for="profGender">Gender <span class="prof-opt">(optional)</span></label>
-        <select id="profGender" class="prof-input prof-select">
-          <option value="">Prefer not to say</option>
-          <option value="male">Male</option>
-          <option value="female">Female</option>
-          <option value="nonbinary">Non-binary</option>
-          <option value="other">Other</option>
-        </select>
+      <div class="prof-info-rows" id="profInfoRows" hidden>
+        <div class="prof-info-row" id="piName" hidden>
+          <span class="prof-info-lbl">Name</span>
+          <span class="prof-info-val" id="piNameVal">—</span>
+        </div>
+        <div class="prof-info-row" id="piAge" hidden>
+          <span class="prof-info-lbl">Age</span>
+          <span class="prof-info-val" id="piAgeVal">—</span>
+        </div>
+        <div class="prof-info-row" id="piGender" hidden>
+          <span class="prof-info-lbl">Gender</span>
+          <span class="prof-info-val" id="piGenderVal">—</span>
+        </div>
+        <div class="prof-info-row" id="piGoal" hidden>
+          <span class="prof-info-lbl">Goal</span>
+          <span class="prof-info-val" id="piGoalVal">—</span>
+        </div>
       </div>
     </div>
-  </div>
 
-  <!-- Wellness Goal -->
-  <div class="prof-section">
-    <h3 class="prof-section-title">Wellness Goal</h3>
-    <p class="prof-section-sub">Personalises your music and insights.</p>
-    <div class="goal-grid" role="radiogroup" id="goalGrid">
-      <button class="goal-btn" data-goal="relaxation" onclick="selectGoal('relaxation')" role="radio" aria-checked="false">
-        <span class="goal-icon">🧘</span><span class="goal-lbl">Relaxation</span>
-      </button>
-      <button class="goal-btn" data-goal="fitness" onclick="selectGoal('fitness')" role="radio" aria-checked="false">
-        <span class="goal-icon">🏃</span><span class="goal-lbl">Fitness</span>
-      </button>
-      <button class="goal-btn" data-goal="stress" onclick="selectGoal('stress')" role="radio" aria-checked="false">
-        <span class="goal-icon">🧠</span><span class="goal-lbl">Stress Monitoring</span>
-      </button>
-      <button class="goal-btn" data-goal="sleep" onclick="selectGoal('sleep')" role="radio" aria-checked="false">
-        <span class="goal-icon">🌙</span><span class="goal-lbl">Sleep Improvement</span>
-      </button>
+    <!-- Subscription card (view mode) -->
+    <div class="sub-card" id="subCard" role="region" aria-label="Subscription">
+      <div class="sub-card-left">
+        <span class="sub-pill" id="subPill">Free Plan</span>
+        <p class="sub-desc" id="subDesc">Upgrade to unlock unlimited sessions, advanced HRV insights &amp; exclusive soundscapes.</p>
+      </div>
+      <button class="btn-upgrade" onclick="upgradeSubscription()">Upgrade</button>
+    </div>
+
+    <div class="app-info" role="contentinfo">
+      <p class="app-info-name">HeartBeat Studio</p>
+      <p class="app-info-ver">Version 5.2</p>
     </div>
   </div>
 
-  <button class="btn btn-p mb-3" onclick="saveProfile()">Save Profile</button>
+  <!-- ── EDIT MODE ─────────────────────────────────────── -->
+  <div id="profEditMode" hidden>
+    <div class="prof-section">
+      <h3 class="prof-section-title">Personal Info</h3>
+      <div class="prof-field">
+        <label class="prof-label" for="profName">Display Name</label>
+        <input type="text" id="profName" class="prof-input" placeholder="Your name" maxlength="40" autocomplete="name">
+      </div>
+      <div class="prof-field-row">
+        <div class="prof-field prof-field-half">
+          <label class="prof-label" for="profAge">Age <span class="prof-opt">(optional)</span></label>
+          <input type="number" id="profAge" class="prof-input" placeholder="e.g. 32" min="13" max="120">
+        </div>
+        <div class="prof-field prof-field-half">
+          <label class="prof-label" for="profGender">Gender <span class="prof-opt">(optional)</span></label>
+          <select id="profGender" class="prof-input prof-select">
+            <option value="">Prefer not to say</option>
+            <option value="male">Male</option>
+            <option value="female">Female</option>
+            <option value="nonbinary">Non-binary</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+      </div>
+    </div>
 
-  <div class="app-info" role="contentinfo">
-    <p class="app-info-name">HeartBeat Studio</p>
-    <p class="app-info-ver">Version 5.0 · <span class="app-info-link" onclick="showScreen('home')">Home</span></p>
+    <div class="prof-section">
+      <h3 class="prof-section-title">Wellness Goal</h3>
+      <p class="prof-section-sub">Personalises your music and insights.</p>
+      <div class="goal-grid" role="radiogroup" id="goalGrid">
+        <button class="goal-btn" data-goal="relaxation" onclick="selectGoal('relaxation')" role="radio" aria-checked="false">
+          <span class="goal-icon">🧘</span><span class="goal-lbl">Relaxation</span>
+        </button>
+        <button class="goal-btn" data-goal="fitness" onclick="selectGoal('fitness')" role="radio" aria-checked="false">
+          <span class="goal-icon">🏃</span><span class="goal-lbl">Fitness</span>
+        </button>
+        <button class="goal-btn" data-goal="stress" onclick="selectGoal('stress')" role="radio" aria-checked="false">
+          <span class="goal-icon">🧠</span><span class="goal-lbl">Stress Monitoring</span>
+        </button>
+        <button class="goal-btn" data-goal="sleep" onclick="selectGoal('sleep')" role="radio" aria-checked="false">
+          <span class="goal-icon">🌙</span><span class="goal-lbl">Sleep Improvement</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="prof-edit-actions">
+      <button class="btn btn-p" onclick="saveProfile()">💾 Save Profile</button>
+      <button class="btn btn-s" onclick="cancelProfileEdit()">Cancel</button>
+    </div>
   </div>
+
   <div class="gap-8"></div>
 </section>
 
