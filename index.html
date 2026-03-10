@@ -2662,20 +2662,36 @@ const GenreEngine = (() => {
 
     rock: {
       label:'Rock', emoji:'🎸',
-      /* E minor / E major power chord roots */
-      scale: [NOTE.E4, NOTE.G4, NOTE.A4, NOTE.B4, NOTE.D5, NOTE.E5, NOTE.G5, NOTE.B5],
-      bass:  [NOTE.E2, NOTE.A2, NOTE.D3, NOTE.E2],
+      /* E minor pentatonic — THE classic rock/blues scale
+         E G A B D — all power chord friendly, zero dissonance */
+      scale: [NOTE.E3, NOTE.G3, NOTE.A3, NOTE.B3, NOTE.D4,
+              NOTE.E4, NOTE.G4, NOTE.A4, NOTE.B4, NOTE.D5],
+      bass:  [NOTE.E2, NOTE.A2, NOTE.D2, NOTE.G2],
       chordProg: [
-        [0,2,4], /* Em */
-        [2,4,6], /* Am */
-        [1,3,5], /* G  */
-        [0,2,4], /* Em */
+        [0,2,4], /* Em  — i   */
+        [0,2,4], /* Em  — repeat for 2 bars */
+        [2,4,6], /* Am  — iv  */
+        [1,3,5], /* G   — VII */
       ],
-      seqK:  [1,0,0,0, 0,0,1,0, 1,0,0,0, 0,0,1,0],
+      /* Rock drum groove — kick on 1 and 3, snare on 2 and 4
+         Extra kick hit on the "and" of 4 (step 14) for drive.
+         Straight 8th hi-hats — the classic rock feel. */
+      seqK:  [1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,1,0],
       seqS:  [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0],
       seqH:  [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0],
-      seqOH: [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1],
-      melRhythm: [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0],
+      seqOH: [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0],
+      /* Guitar riff rhythm — the locked riff is defined in _tick.
+         This array is used for bass guitar, not lead guitar. */
+      melRhythm: [0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0], /* riff handled in _tick */
+
+      /* Pentatonic riff: 16-step locked guitar riff pattern
+         Each value is a scale INDEX into rock.scale[].
+         This is the repeating riff — same every bar, so it sounds like ROCK.
+         Pattern: E root → G → A → rest → E → D → E → rest... */
+      riffPat:   [0, 0, 2, 3,   0, 0,-1,-1,   0, 2, 3, 4,   2,-1, 0,-1],
+      /* -1 = rest (palm mute / silence) */
+      riffDur:   [4, 2, 2, 4,   4, 2, 0, 0,   2, 2, 2, 4,   2, 0, 2, 0],
+      /* riffDur: duration in 16th-note multiples (0 = skip) */
     },
 
     latin: {
@@ -2859,19 +2875,113 @@ const GenreEngine = (() => {
     o.connect(lp); lp.connect(e); e.connect(dest); o.start(t); o.stop(t+dur+0.01);
   }
 
+  /* ── Distorted guitar power chord ──────────────────────────────
+     Root + perfect 5th + octave, fed through a hard asymmetric
+     clipper (2-stage) then a mid-boost EQ. This is what makes
+     electric guitar sound like electric guitar: the hard clipping
+     creates the characteristic "buzz" and sustain.
+  ─────────────────────────────────────────────────────────────── */
   function _powerChord(c, t, root, dur, dest, sid) {
     if (_globalSid !== sid || !dest) return;
-    const e = c.createGain(); e.gain.setValueAtTime(0, t); e.gain.linearRampToValueAtTime(0.24, t+0.012);
-    e.gain.setValueAtTime(0.24, t+dur-0.04); e.gain.linearRampToValueAtTime(0.001, t+dur);
-    const curve = new Float32Array(512);
-    for (let i=0;i<512;i++) { const x=i*2/511-1; curve[i]=Math.tanh(x*4); }
+
+    /* Envelope: fast attack, tight sustain, short release */
+    const env = c.createGain();
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(0.9, t + 0.008); /* snap attack */
+    env.gain.setValueAtTime(0.9, t + dur * 0.7);
+    env.gain.exponentialRampToValueAtTime(0.001, t + dur);
+
+    /* Three oscillators: root, 5th, octave — classic power chord voicing */
+    const o1 = c.createOscillator(); o1.type = 'sawtooth'; o1.frequency.value = root;
+    const o2 = c.createOscillator(); o2.type = 'sawtooth'; o2.frequency.value = root * 1.4983; /* P5 */
+    const o3 = c.createOscillator(); o3.type = 'sawtooth'; o3.frequency.value = root * 2.0;   /* octave */
+
+    /* Mix before distortion — octave slightly quieter */
+    const mix = c.createGain(); mix.gain.value = 0.33;
+    const g3  = c.createGain(); g3.gain.value  = 0.18;
+    o1.connect(mix); o2.connect(mix); o3.connect(g3); g3.connect(mix);
+
+    /* Stage 1: pre-gain boost into hard clipper */
+    const preGain = c.createGain(); preGain.gain.value = 6.0;
+    mix.connect(preGain);
+
+    /* Hard asymmetric clipper — this is the key to guitar tone.
+       Asymmetry creates even harmonics (warm grit) on top of odd (buzz).
+       Shape: soft on positive half, harder on negative half */
+    const N = 1024;
+    const curve = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const x = (i * 2 / (N - 1)) - 1;
+      if (x >= 0)      curve[i] = Math.min(1,  x * 2.8 - x * x * 1.2); /* compress top */
+      else             curve[i] = Math.max(-1, x * 3.2);                  /* harder clip bottom */
+    }
+    const dist = c.createWaveShaper(); dist.curve = curve; dist.oversample = '4x';
+    preGain.connect(dist);
+
+    /* Stage 2: post-dist gain normalise */
+    const postGain = c.createGain(); postGain.gain.value = 0.22;
+    dist.connect(postGain);
+
+    /* Tone stack: cut lows (mud), boost mids (presence), slight hi cut (harshness) */
+    const hipass = c.createBiquadFilter(); hipass.type='highpass'; hipass.frequency.value = 80;
+    const mid    = c.createBiquadFilter(); mid.type='peaking';
+      mid.frequency.value = 1200; mid.gain.value = 5; mid.Q.value = 1.2;
+    const lopass = c.createBiquadFilter(); lopass.type='lowpass'; lopass.frequency.value = 5500;
+    postGain.connect(hipass); hipass.connect(mid); mid.connect(lopass);
+    lopass.connect(env); env.connect(dest);
+
+    o1.start(t); o2.start(t); o3.start(t);
+    o1.stop(t+dur+0.02); o2.stop(t+dur+0.02); o3.stop(t+dur+0.02);
+  }
+
+  /* ── Palm-muted chunk — tight percussive guitar hit ────────────
+     Used for rhythmic "chug" between riff notes. Short, heavy,
+     distorted. The attack IS the sound — envelope decays fast.
+  ─────────────────────────────────────────────────────────────── */
+  function _palmMute(c, t, root, dest, sid) {
+    if (_globalSid !== sid || !dest) return;
+    const env = c.createGain();
+    env.gain.setValueAtTime(0.7, t);
+    env.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+    const o = c.createOscillator(); o.type = 'sawtooth'; o.frequency.value = root;
+    const N = 512; const curve = new Float32Array(N);
+    for (let i=0;i<N;i++) { const x=i*2/(N-1)-1; curve[i]=Math.sign(x)*Math.min(1,Math.abs(x)*8); }
     const ws = c.createWaveShaper(); ws.curve=curve; ws.oversample='2x';
-    const mix = c.createGain(); mix.gain.value=0.5;
-    const o1 = c.createOscillator(), o2 = c.createOscillator();
-    o1.type='sawtooth'; o2.type='sawtooth';
-    o1.frequency.value=root; o2.frequency.value=root*1.498; /* perfect 5th */
-    o1.connect(ws); o2.connect(ws); ws.connect(mix); mix.connect(e); e.connect(dest);
-    o1.start(t); o2.start(t); o1.stop(t+dur+0.01); o2.stop(t+dur+0.01);
+    const lp = c.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=1800;
+    const g = c.createGain(); g.gain.value=0.28;
+    o.connect(ws); ws.connect(lp); lp.connect(g); g.connect(env); env.connect(dest);
+    o.start(t); o.stop(t+0.12);
+  }
+
+  /* ── Rock kick — heavier than pop, deeper thud ─────────────── */
+  function _rockKick(c, t, dest, sid) {
+    if (_globalSid !== sid || !dest) return;
+    const e = c.createGain(); e.gain.setValueAtTime(1.0, t); e.gain.exponentialRampToValueAtTime(0.001, t+0.28);
+    const o = c.createOscillator(); o.type='sine';
+    o.frequency.setValueAtTime(180, t); o.frequency.exponentialRampToValueAtTime(30, t+0.22);
+    /* Transient click */
+    const click = c.createOscillator(); click.type='square'; click.frequency.value=200;
+    const ce = c.createGain(); ce.gain.setValueAtTime(0.4, t); ce.gain.exponentialRampToValueAtTime(0.001, t+0.015);
+    click.connect(ce); ce.connect(dest); click.start(t); click.stop(t+0.02);
+    o.connect(e); e.connect(dest); o.start(t); o.stop(t+0.30);
+  }
+
+  /* ── Rock snare — crack + full body ────────────────────────── */
+  function _rockSnare(c, t, dest, sid) {
+    if (_globalSid !== sid || !dest) return;
+    /* Body: tuned tone */
+    const o = c.createOscillator(), oe = c.createGain();
+    o.type='triangle'; o.frequency.setValueAtTime(220, t); o.frequency.exponentialRampToValueAtTime(120, t+0.06);
+    oe.gain.setValueAtTime(0.5, t); oe.gain.exponentialRampToValueAtTime(0.001, t+0.12);
+    o.connect(oe); oe.connect(dest); o.start(t); o.stop(t+0.14);
+    /* Snare wires: wide noise burst */
+    const buf = c.createBuffer(1, Math.floor(c.sampleRate*0.22), c.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i=0;i<d.length;i++) d[i] = Math.random()*2-1;
+    const n = c.createBufferSource(); n.buffer=buf;
+    const bp = c.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=3500; bp.Q.value=0.8;
+    const ne = c.createGain(); ne.gain.setValueAtTime(0.6, t); ne.gain.exponentialRampToValueAtTime(0.001, t+0.20);
+    n.connect(bp); bp.connect(ne); ne.connect(dest); n.start(t); n.stop(t+0.22);
   }
 
   function _clave(c, t, dest, sid) {
@@ -2917,11 +3027,17 @@ const GenreEngine = (() => {
     const D16 = _step16Sec; /* duration of one 16th note */
     const BEAT = D16 * 4;  /* one full beat (quarter note) */
 
-    /* ── Drums ── */
-    if (g.seqK[s])  _kick(c, t, dest, sid);
-    if (g.seqS[s])  _snare(c, t, dest, sid);
-    if (g.seqH[s])  _hat(c, t, s%2===0?0.14:0.08, dest, sid);
-    if (g.seqOH[s]) _openHat(c, t, dest, sid);
+    /* ── Drums — rock gets heavier kit ── */
+    if (_style === 'rock') {
+      if (g.seqK[s])  _rockKick(c, t, dest, sid);
+      if (g.seqS[s])  _rockSnare(c, t, dest, sid);
+      if (g.seqH[s])  _hat(c, t, s%2===0?0.18:0.10, dest, sid);
+    } else {
+      if (g.seqK[s])  _kick(c, t, dest, sid);
+      if (g.seqS[s])  _snare(c, t, dest, sid);
+      if (g.seqH[s])  _hat(c, t, s%2===0?0.14:0.08, dest, sid);
+      if (g.seqOH[s]) _openHat(c, t, dest, sid);
+    }
 
     /* ── Genre-specific extras ── */
     if (_style === 'latin' && g.clave[s]) _clave(c, t, dest, sid);
@@ -2947,23 +3063,41 @@ const GenreEngine = (() => {
       if (s===0||s===8) _bass(c, t, bassNote, BEAT*0.88, dest, sid);
     }
 
-    /* ── Melody ── */
-    if (g.melRhythm[s]) {
+    /* ── Melody / Guitar riff ── */
+    if (_style === 'rock') {
+      /* Rock guitar: locked riff pattern from riffPat[] — NOT random stepwise.
+         riffPat[s] = scale index (-1 = palm mute rest).
+         riffDur[s] = note length in 16th-note units.
+         This gives a repeating, recognisable guitar riff every bar. */
+      const ri = g.riffPat[s];
+      const rd = g.riffDur[s];
+      if (rd > 0) {
+        const noteDur = D16 * rd * 0.88; /* slight gate for articulation */
+        if (ri >= 0) {
+          _powerChord(c, t, g.scale[ri % g.scale.length], noteDur, dest, sid);
+        } else {
+          /* Palm mute: percussive chunk on root */
+          _palmMute(c, t, g.scale[0], dest, sid);
+        }
+      }
+      /* Bass guitar: follows root on beats 1+3 with walking on beat 4 */
+      if (s===0)  _bass(c, t, g.bass[_chordIdx%g.bass.length],       BEAT*0.92, dest, sid);
+      if (s===8)  _bass(c, t, g.bass[_chordIdx%g.bass.length],       BEAT*0.88, dest, sid);
+      if (s===12) _bass(c, t, g.bass[(_chordIdx+1)%g.bass.length],   D16*1.8,   dest, sid);
+    } else if (g.melRhythm[s]) {
       const freq = (_style === 'edm')
-        ? g.scale[g.arpPat[s] % g.scale.length] /* EDM: fixed arp pattern, not random */
+        ? g.scale[g.arpPat[s] % g.scale.length]
         : _nextMelNote(g);
 
-      const melDur = (_style === 'edm') ? D16*0.85
+      const melDur = (_style === 'edm')    ? D16*0.85
                    : (_style === 'hiphop') ? BEAT*1.6
-                   : (_style === 'rock')   ? BEAT*0.88
                    : (_style === 'latin')  ? D16*3.0
-                   : BEAT*0.78; /* pop */
+                   : BEAT*0.78;
 
       switch (_style) {
         case 'pop':    _sawLead(c, t, freq, melDur, dest, sid); break;
         case 'hiphop': _sineLead(c, t, freq, melDur, dest, sid); break;
         case 'edm':    _sawLead(c, t, freq, melDur, dest, sid); break;
-        case 'rock':   _powerChord(c, t, freq, melDur, dest, sid); break;
         case 'latin':  _sineLead(c, t, freq, melDur, dest, sid); break;
       }
     }
@@ -3127,10 +3261,11 @@ const S = {
   stream:null, track:null, rafId:null, scanTimer:null,
   elapsed:0, SCAN_SEC:30,
   ppgBuf:[], ppgTs:[], peakTs:[],
+  ppgBufSnapshot:[], ppgTsSnapshot:[], peakTsSnapshot:[],
   ema:0, EMA_A:.08, quality:0, frameN:0,
   bpmHist:[], prevBpm:72, bpm:72, hrv:45,
   minBpm:68, maxBpm:78, mood:'balanced', musicBpm:72,
-  amplitude:0, bpmTrend:'stable', lastBeatFlash:0, liveHrv:0,
+  amplitude:0, fingerPresent:false, bpmTrend:'stable', lastBeatFlash:0, liveHrv:0,
   heartbeatTimeline:[], timelineTimer:null,
   pbTimer:null, pbElapsed:0,
   resultWavRaf:null, libPlayingId:null,
@@ -3314,7 +3449,10 @@ function startResultWave(bpm) {
      Strategy: take the captured PPG signal (normalised), then scroll
      it left one pixel per frame, cycling through the buffer.
      This gives a "live ECG monitor" feel using YOUR actual waveform. */
-  const rawBuf=(S.ppgBuf&&S.ppgBuf.length>20)?S.ppgBuf.slice():null;
+  /* Use snapshot saved at scan end — immune to later buffer clears */
+  const rawBuf=(S.ppgBufSnapshot&&S.ppgBufSnapshot.length>20)
+    ? S.ppgBufSnapshot
+    : (S.ppgBuf&&S.ppgBuf.length>20) ? S.ppgBuf.slice() : null;
 
   /* Normalise a source buffer to [0,1] */
   function normBuf(buf){
@@ -3353,11 +3491,13 @@ function startResultWave(bpm) {
 
   /* Find R-peak positions within the source buffer */
   const peakSet=new Set();
-  if(rawBuf&&S.peakTs&&S.peakTs.length&&S.ppgTs&&S.ppgTs.length===rawBuf.length){
-    S.peakTs.forEach(pt=>{
+  const _snapTs   = S.ppgTsSnapshot  || S.ppgTs;
+  const _snapPeaks = S.peakTsSnapshot || S.peakTs;
+  if(rawBuf&&_snapPeaks&&_snapPeaks.length&&_snapTs&&_snapTs.length===rawBuf.length){
+    _snapPeaks.forEach(pt=>{
       let best=-1,bestD=Infinity;
-      for(let k=0;k<S.ppgTs.length;k++){
-        const d=Math.abs(S.ppgTs[k]-pt);
+      for(let k=0;k<_snapTs.length;k++){
+        const d=Math.abs(_snapTs[k]-pt);
         if(d<bestD){bestD=d;best=k;}
       }
       if(best>=0&&bestD<100) peakSet.add(best);
@@ -3580,6 +3720,7 @@ function _showErr(type) {
 /* ── RESET ─────────────────────────────────────────────────── */
 function _resetScan() {
   S.ppgBuf=[];S.ppgTs=[];S.bpmHist=[];S.peakTs=[];
+  S.ppgBufSnapshot=[];S.ppgTsSnapshot=[];S.peakTsSnapshot=[];
   S.ema=0;S.quality=0;S.elapsed=0;S.frameN=0;
   S.prevBpm=72;S.amplitude=0;S.bpmTrend='stable';S.liveHrv=0;
   S.heartbeatTimeline=[]; S.lastBeatFlash=0;
@@ -3622,6 +3763,34 @@ function _beginPPG(vid) {
     const px=offCtx.getImageData(0,0,40,30).data; let rs=0;
     for(let i=0;i<px.length;i+=4) rs+=px[i];
     const raw=rs/(px.length/4);
+
+    /* ── FINGER DETECTION ────────────────────────────────────────
+       A finger blocking the lens makes the red channel very bright
+       (torch light through tissue = high red).
+       Without a finger: raw red ≈ ambient, typically < 80 on most
+       cameras in normal lighting.
+       Threshold: avg red pixel > 100 = finger present.
+       This is the PRIMARY guard against phantom readings.
+    ─────────────────────────────────────────────────────────────── */
+    const fingerPresent = raw > 100;
+    S.fingerPresent = fingerPresent;
+
+    if (!fingerPresent) {
+      /* No finger — reset everything, show prompt */
+      sq.length = 0;
+      S.ppgBuf = []; S.ppgTs = []; S.peakTs = [];
+      S.bpmHist = []; S.prevBpm = 72;
+      lastPk = -1;
+      setSig(0);
+      setFb('init');
+      if (fi > 15) { /* avoid flicker on first frames */
+        $set('liveBpm', '--');
+        const p = $id('bpmPill'); if (p) { p.textContent=''; p.className='bpm-pill'; }
+      }
+      S.rafId = requestAnimationFrame(frame);
+      return; /* skip ALL processing — no finger, no data */
+    }
+
     S.ema=S.EMA_A*raw+(1-S.EMA_A)*S.ema;
     sq.push(S.ema); if(sq.length>SMOOTH_K)sq.shift();
     const sm=sq.reduce((a,b)=>a+b,0)/sq.length;
@@ -3631,10 +3800,11 @@ function _beginPPG(vid) {
     const win=S.ppgBuf.slice(-DC_WIN);
     const lo=Math.min(...win), hi=Math.max(...win), amp=hi-lo;
     S.amplitude=Math.min(1,amp/8);
+    /* q>=3 required for peak detection — raises bar above noise/movement */
     const q=Math.min(5,Math.floor(amp/1.2)); setSig(q);
     if(fi<30)setFb('init'); else if(q<=1)setFb('weak'); else if(q<=2)setFb('ok'); else setFb('strong');
     const n=S.ppgBuf.length;
-    if(n>5&&q>=2){
+    if(n>5&&q>=3){  /* raised from q>=2 to q>=3 — require decent signal */
       const c1=S.ppgBuf[n-3],c2=S.ppgBuf[n-2],c3=S.ppgBuf[n-1];
       const norm=(c2-lo)/(amp||1);
       const isPk=c2>c1&&c2>c3&&norm>.55;
@@ -3693,8 +3863,23 @@ function _finalize() {
   Storage.incrementUsage();
 
   let bpm;
-  if(S.bpmHist.length>=3){bpm=median(S.bpmHist);}
-  else{bpm=62+Math.round(Math.random()*30);toast('Weak signal — estimated result shown','warn',4000);}
+  if(S.bpmHist.length>=3){
+    bpm=median(S.bpmHist);
+  } else {
+    /* No valid pulse detected — block results entirely.
+       Show the scan screen with an error message rather than
+       inventing a random BPM that would mislead the user. */
+    toast('No pulse detected — place your fingertip firmly over the rear camera lens and try again.','warn',5000);
+    setFb('weak');
+    /* Re-enable the scan button so user can try again */
+    const btn=$id('scanBtn')||document.querySelector('.btn-scan, [onclick="startScan()"]');
+    if(btn){btn.disabled=false;btn.textContent='Try Again';}
+    /* Go back to scan screen so user can retry */
+    showScreen('scan');
+    /* Re-enable the Start Scan button on home too */
+    S.scanning=false;
+    return;
+  }
   bpm=Math.max(40,Math.min(200,bpm));
 
   /* ── BIOMETRIC PULSE FINGERPRINT ─────────────────────────────
@@ -3744,12 +3929,22 @@ function _finalize() {
   const maxBpm=Math.min(200,bpm+Math.round(Math.random()*7+2));
   const mood=_mood(bpm,hrv);
   S.bpm=bpm;S.hrv=hrv;S.minBpm=minBpm;S.maxBpm=maxBpm;S.mood=mood;S.musicBpm=bpm;
+  /* Snapshot ppg data NOW before anything can clear it */
+  S.ppgBufSnapshot  = S.ppgBuf.slice();
+  S.ppgTsSnapshot   = S.ppgTs.slice();
+  S.peakTsSnapshot  = S.peakTs.slice();
+
   _snapshotTimeline(); _fillResults(); showScreen('results');
 
   const banner=$id('genBanner'); if(banner)banner.hidden=false;
-  startResultWave(bpm);
-  /* Resume AudioContext immediately — it was unlocked on user gesture (startScan).
-     We then start music right away; the generating spinner shows until audio begins. */
+
+  /* Defer wave draw by two rAFs — browser must finish layout first
+     so canvas.offsetWidth is non-zero when we read it */
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    startResultWave(bpm);
+  }));
+
+  /* Start music in parallel */
   _startMusic(bpm,hrv).then(()=>{
     if(banner)banner.hidden=true;
   });
